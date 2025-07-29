@@ -12,7 +12,7 @@ if not firebase_admin._apps:
     firebase_key = json.loads(os.environ["FIREBASE_KEY"])
     cred = credentials.Certificate(firebase_key)
     firebase_admin.initialize_app(cred, {
-        'storageBucket': 'class-recorder-6ce3f.firebasestorage.app'
+        'storageBucket': firebase_key["storageBucket"]
     })
 
 db = firestore.client()
