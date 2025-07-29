@@ -1,162 +1,157 @@
 import streamlit as st
 import firebase_admin
-from firebase_admin import credentials, firestore, storage, auth
+from firebase_admin import credentials, firestore, storage
 import pandas as pd
 import datetime
-import tempfile
-import os, json
-
 
 # Firebase 초기화
 if not firebase_admin._apps:
-    firebase_key = dict(st.secrets["FIREBASE_KEY"])
-    cred = credentials.Certificate(firebase_key)
+    cred = credentials.Certificate(st.secrets["FIREBASE_KEY"])
     firebase_admin.initialize_app(cred, {
-        'storageBucket': firebase_key["storageBucket"]
+        'storageBucket': st.secrets["FIREBASE_KEY"]["storageBucket"]
     })
 
 db = firestore.client()
 bucket = storage.bucket()
 
-st.set_page_config(page_title="Course Management App", layout="wide")
+# 메뉴
+menu = st.sidebar.selectbox("메뉴 선택", ["교과 관리", "수업 관리", "학생 관리", "진도 관리", "출결 관리"])
 
-# if "user" not in st.session_state:
-#     st.session_state.user = None
-#
-# def login():
-#     st.title("로그인")
-#     email = st.text_input("이메일")
-#     password = st.text_input("비밀번호", type="password")
-#     if st.button("로그인"):
-#         try:
-#             user = auth.get_user_by_email(email)
-#             st.session_state.user = user
-#             st.success("로그인 성공!")
-#         except:
-#             st.error("로그인 실패")
+### 교과 관리 ###
+if menu == "교과 관리":
+    st.header("교과 관리")
+    subjects_ref = db.collection("subjects")
 
-def manage_courses():
-    st.header("담당 교과 관리")
-    courses_ref = db.collection("courses")
-    courses = courses_ref.stream()
-    data = [[c.to_dict().get("name"), c.to_dict().get("year"), c.to_dict().get("semester"), c.to_dict().get("file_url")] for c in courses]
-    st.dataframe(pd.DataFrame(data, columns=["교과명", "학년도", "학기", "계획서 URL"]))
+    # 교과 목록 표시
+    subjects = subjects_ref.stream()
+    data = [{"id": s.id, **s.to_dict()} for s in subjects]
+    st.table(pd.DataFrame(data))
 
     st.subheader("교과 추가")
-    name = st.text_input("교과명")
-    year = st.selectbox("학년도", list(range(2020, 2031)))
-    semester = st.selectbox("학기", [1, 2])
-    file = st.file_uploader("PDF 업로드", type=["pdf"])
+    with st.form("add_subject"):
+        name = st.text_input("교과명")
+        year = st.number_input("학년도", 2020, 2100, 2025)
+        semester = st.selectbox("학기", [1, 2])
+        file = st.file_uploader("계획서 업로드 (PDF, 10MB 제한)", type=["pdf"])
+        submitted = st.form_submit_button("저장")
 
-    if st.button("저장"):
-        if file and file.size <= 10*1024*1024:
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp.write(file.read())
-            tmp.close()
-            blob = bucket.blob(f"courses/{file.name}")
-            blob.upload_from_filename(tmp.name)
-            url = blob.generate_signed_url(datetime.timedelta(days=365))
-            courses_ref.add({"name": name, "year": year, "semester": semester, "file_url": url})
-            st.success("교과가 추가되었습니다.")
-        else:
-            st.error("10MB 이하의 PDF 파일만 업로드 가능합니다.")
+        if submitted:
+            if file and file.size <= 10*1024*1024:
+                blob = bucket.blob(f"plans/{file.name}")
+                blob.upload_from_file(file, content_type="application/pdf")
+                plan_url = blob.public_url
+                subjects_ref.add({"name": name, "year": year, "semester": semester, "plan_url": plan_url})
+                st.success("교과가 추가되었습니다.")
+            else:
+                st.error("파일은 PDF 형식이며 10MB 이하이어야 합니다.")
 
-def manage_classes():
-    st.header("수업 등록 및 관리")
+### 수업 관리 ###
+if menu == "수업 관리":
+    st.header("수업 관리")
     classes_ref = db.collection("classes")
+    subjects_ref = db.collection("subjects")
+    subjects = subjects_ref.stream()
+    subject_list = {s.id: s.to_dict()["name"] for s in subjects}
+
     classes = classes_ref.stream()
-    data = [[c.to_dict().get("year"), c.to_dict().get("semester"), c.to_dict().get("course"), c.to_dict().get("class_name"), c.to_dict().get("days"), c.to_dict().get("period") ] for c in classes]
-    st.dataframe(pd.DataFrame(data, columns=["학년도", "학기", "교과", "학반", "요일", "교시"]))
+    data = [{"id": c.id, **c.to_dict()} for c in classes]
+    st.table(pd.DataFrame(data))
 
-    st.subheader("수업 추가")
-    year = st.selectbox("학년도", list(range(2020, 2031)), key="class_year")
-    semester = st.selectbox("학기", [1, 2], key="class_sem")
-    course_list = [c.to_dict().get("name") for c in db.collection("courses").stream()]
-    course = st.selectbox("교과 선택", course_list)
-    class_name = st.text_input("학반")
-    days = st.multiselect("요일 선택", ["월", "화", "수", "목", "금"])
-    period = st.number_input("교시", min_value=1, max_value=10, step=1)
+    with st.form("add_class"):
+        year = st.number_input("학년도", 2020, 2100, 2025)
+        semester = st.selectbox("학기", [1, 2])
+        subject_id = st.selectbox("교과 선택", options=list(subject_list.keys()), format_func=lambda x: subject_list[x])
+        class_name = st.text_input("반 이름")
+        schedule_day = st.selectbox("요일", ["월", "화", "수", "목", "금"])
+        schedule_period = st.number_input("교시", 1, 10, 1)
+        submitted = st.form_submit_button("저장")
 
-    if st.button("수업 저장"):
-        classes_ref.add({"year": year, "semester": semester, "course": course, "class_name": class_name, "days": days, "period": period})
-        st.success("수업이 추가되었습니다.")
+        if submitted:
+            classes_ref.add({
+                "subject_id": subject_id,
+                "year": year,
+                "semester": semester,
+                "class_name": class_name,
+                "schedule": [{"day": schedule_day, "period": schedule_period}]
+            })
+            st.success("수업이 추가되었습니다.")
 
-def manage_students():
-    st.header("학생 등록 및 관리")
-    class_list = [c.id for c in db.collection("classes").stream()]
-    class_id = st.selectbox("수업 반 선택", class_list)
-    students_ref = db.collection("classes").document(class_id).collection("students")
-    students = students_ref.stream()
-    data = [[s.to_dict().get("id"), s.to_dict().get("name")] for s in students]
-    st.dataframe(pd.DataFrame(data, columns=["학번", "성명"]))
+### 학생 관리 ###
+if menu == "학생 관리":
+    st.header("학생 관리")
+    classes_ref = db.collection("classes")
+    students_ref = db.collection("students")
+
+    classes = classes_ref.stream()
+    class_list = {c.id: c.to_dict()["class_name"] for c in classes}
+
+    class_id = st.selectbox("반 선택", options=list(class_list.keys()), format_func=lambda x: class_list[x])
+    students = students_ref.where("class_id", "==", class_id).stream()
+    data = [{"id": s.id, **s.to_dict()} for s in students]
+    st.table(pd.DataFrame(data))
 
     st.subheader("학생 추가")
-    sid = st.text_input("학번")
-    sname = st.text_input("성명")
-    if st.button("학생 추가"):
-        students_ref.add({"id": sid, "name": sname})
-        st.success("학생이 추가되었습니다.")
+    with st.form("add_student"):
+        student_no = st.text_input("학번")
+        name = st.text_input("성명")
+        submitted = st.form_submit_button("추가")
+
+        if submitted:
+            students_ref.add({"class_id": class_id, "student_no": student_no, "name": name})
+            st.success("학생이 추가되었습니다.")
 
     st.subheader("CSV 업로드")
-    file = st.file_uploader("CSV 업로드", type=["csv"])
-    if file and st.button("CSV로 등록"):
-        df = pd.read_csv(file)
+    csv_file = st.file_uploader("CSV 파일 업로드", type=["csv"])
+    if csv_file:
+        df = pd.read_csv(csv_file)
         for _, row in df.iterrows():
-            students_ref.add({"id": row["학번"], "name": row["성명"]})
-        st.success("CSV 학생 등록 완료")
+            students_ref.add({"class_id": class_id, "student_no": row["학번"], "name": row["성명"]})
+        st.success("학생 목록이 업로드되었습니다.")
 
-def manage_progress():
-    st.header("진도 및 특기사항 기록")
-    class_list = [c.id for c in db.collection("classes").stream()]
-    class_id = st.selectbox("수업 반 선택", class_list)
-    date = st.date_input("날짜 선택")
-    period = st.number_input("교시", min_value=1, max_value=10, step=1, key="progress_period")
+### 진도 관리 ###
+if menu == "진도 관리":
+    st.header("진도 관리")
+    classes_ref = db.collection("classes")
+    class_list = {c.id: c.to_dict()["class_name"] for c in classes_ref.stream()}
+
+    class_id = st.selectbox("반 선택", options=list(class_list.keys()), format_func=lambda x: class_list[x])
+    date = st.date_input("날짜", datetime.date.today())
+    period = st.number_input("교시", 1, 10, 1)
     content = st.text_area("진도 내용")
     notes = st.text_area("특기사항")
 
-    if st.button("기록 저장"):
-        db.collection("classes").document(class_id).collection("progress").add({
-            "date": str(date), "period": period, "content": content, "notes": notes
+    if st.button("저장"):
+        db.collection("progress").add({
+            "class_id": class_id,
+            "date": date.isoformat(),
+            "period": period,
+            "content": content,
+            "notes": notes
         })
-        st.success("진도 기록 저장 완료")
+        st.success("진도가 저장되었습니다.")
 
-def manage_attendance():
-    st.header("출결 및 특기사항 기록")
-    class_list = [c.id for c in db.collection("classes").stream()]
-    class_id = st.selectbox("수업 반 선택", class_list)
-    date = st.date_input("날짜 선택", key="att_date")
+### 출결 관리 ###
+if menu == "출결 관리":
+    st.header("출결 관리")
+    classes_ref = db.collection("classes")
+    students_ref = db.collection("students")
 
-    students = db.collection("classes").document(class_id).collection("students").stream()
-    records = []
+    class_list = {c.id: c.to_dict()["class_name"] for c in classes_ref.stream()}
+    class_id = st.selectbox("반 선택", options=list(class_list.keys()), format_func=lambda x: class_list[x])
+
+    date = st.date_input("날짜", datetime.date.today())
+
+    students = students_ref.where("class_id", "==", class_id).stream()
     for s in students:
-        st.subheader(f"{s.to_dict().get('name')} ({s.to_dict().get('id')})")
-        status = st.selectbox("출결 상태", ["출석", "지각", "결석", "조퇴"], key=f"status_{s.id}")
-        note = st.text_input("특기사항", key=f"note_{s.id}")
-        records.append({"id": s.id, "name": s.to_dict().get("name"), "status": status, "note": note})
-
-    if st.button("출결 저장"):
-        for r in records:
-            db.collection("classes").document(class_id).collection("attendance").add({
-                "date": str(date), "student_id": r["id"], "name": r["name"], "status": r["status"], "note": r["note"]
+        st.write(f"학생: {s.to_dict()['name']} ({s.to_dict()['student_no']})")
+        status = st.selectbox("출결 상태", ["출석", "결석", "지각", "조퇴"], key=s.id)
+        notes = st.text_input("특기사항", key=s.id+"_note")
+        if st.button("저장", key=s.id+"_btn"):
+            db.collection("attendance").add({
+                "class_id": class_id,
+                "student_id": s.id,
+                "date": date.isoformat(),
+                "status": status,
+                "notes": notes
             })
-        st.success("출결 기록 저장 완료")
-
-
-menu = st.sidebar.selectbox("메뉴", [
-    "담당 교과 관리",
-    "수업 등록 및 관리",
-    "학생 등록 및 관리",
-    "진도 및 특기사항 기록",
-    "출결 및 특기사항 기록"
-])
-
-if menu == "담당 교과 관리":
-    manage_courses()
-elif menu == "수업 등록 및 관리":
-    manage_classes()
-elif menu == "학생 등록 및 관리":
-    manage_students()
-elif menu == "진도 및 특기사항 기록":
-    manage_progress()
-elif menu == "출결 및 특기사항 기록":
-    manage_attendance()
+            st.success("저장되었습니다.")
