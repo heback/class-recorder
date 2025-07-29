@@ -113,7 +113,7 @@ def course_management():
         is_edit = st.session_state.get("editing_course_id") is not None
         title = "교과 수정" if is_edit else "새 교과 추가"
 
-        with st.dialog(title, dismissed=False):
+        with st.dialog(title):
             default_data = {}
             if is_edit:
                 doc_ref = db.collection("courses").document(
@@ -232,7 +232,7 @@ def class_management():
         is_edit = st.session_state.get("editing_class_id") is not None
         title = "수업 수정" if is_edit else "새 수업 추가"
 
-        with st.dialog(title, dismissed=False):
+        with st.dialog(title):
             default_data = {}
             if is_edit:
                 doc = db.collection("classes").document(
@@ -381,7 +381,7 @@ def student_management():
         if st.session_state.get("show_student_dialog"):
             is_edit = st.session_state.get("editing_student_id") is not None
             title = "학생 정보 수정" if is_edit else "학생 추가"
-            with st.dialog(title, dismissed=False):
+            with st.dialog(title):
                 default_data = {}
                 if is_edit:
                     doc = db.collection("classes").document(
@@ -487,7 +487,7 @@ def progress_management():
         if st.session_state.get("show_progress_dialog"):
             is_edit = st.session_state.get("editing_progress_id") is not None
             title = "진도 수정" if is_edit else "진도 추가"
-            with st.dialog(title, dismissed=False):
+            with st.dialog(title):
                 default_data = {}
                 if is_edit:
                     doc = db.collection("classes").document(
