@@ -21,11 +21,11 @@ def init_firebase():
     except Exception as e:
         st.error(f"Firebase 초기화 실패: {e}")
         return None, None
-
+st.write("1")
 db, bucket = init_firebase()
 if db is None:
     st.stop()
-
+st.write("2")
 # Firestore 연결 테스트
 def test_firestore_connection():
     try:
@@ -36,7 +36,7 @@ def test_firestore_connection():
         st.error(e)
 
 test_firestore_connection()
-
+st.write("3")
 menu = st.sidebar.selectbox("메뉴 선택", ["교과 관리", "수업 관리", "학생 관리", "진도 관리", "출결 관리"])
 
 if menu == "교과 관리" and db:
