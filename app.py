@@ -6,9 +6,10 @@ import datetime
 
 # Firebase 초기화
 if not firebase_admin._apps:
-    cred = credentials.Certificate(st.secrets["FIREBASE_KEY"])
+    FIREBASE_KEY = dict(st.secrets["FIREBASE_KEY"])
+    cred = credentials.Certificate(FIREBASE_KEY)
     firebase_admin.initialize_app(cred, {
-        'storageBucket': st.secrets["FIREBASE_KEY"]["storageBucket"]
+        'storageBucket': FIREBASE_KEY["storageBucket"]
     })
 
 db = firestore.client()
