@@ -1,937 +1,985 @@
-# app.py — 수업·평가 운영 시스템 (Streamlit + Firebase)
-# ---------------------------------------------------
-# 요구사항 요약:
-# - 교과(학년도/학기/교과명) 관리 + 수업·평가계획서 PDF 업로드/조회(≤10MB)
-# - 수업반(학년도/학기/교과/학반) 관리 + 요일/교시 시간표
-# - 수업반별 학생 관리(개별 + CSV 업로드)
-# - 수업반별 진도·특기사항(일자/교시) CRUD
-# - 수업반별 출결·특기사항 CRUD (UI 라벨: 출석/결석/지각/공결 ↔ 저장값: P/A/L/E)
-# - 일자 기준 전체 수업반 진도/출결 조회 대시보드
-# - Streamlit Cloud + Firebase(Firestore, Storage), st.secrets["FIREBASE_KEY"] 사용
-# - 모든 입력/수정은 st.dialog 사용, 저장 버튼만 제공(닫기/취소 없음), 저장 후 st.rerun()
-# - 데이터 없음은 st.info로 안내, 예외 처리 철저
+# -*- coding: utf-8 -*-
+"""
+수업·평가 관리 앱 (Streamlit + Firebase Firestore/Storage + Google Sheets Export)
+- 하나의 파일(app.py)에 모든 구현
+- 인증: Streamlit Secrets -> FIREBASE_KEY(dict) 사용, storageBucket 포함
+- 파일 업로드: PDF만, 최대 10MB
+- 입력/수정: st.dialog 사용, 저장 후 st.rerun()
+- 빈 데이터: st.info 안내
+- 메뉴: 사이드바 selectbox
+- Google Sheets 내보내기: 선택한 Firestore 컬렉션을 동일한 스프레드시트 내 시트명=컬렉션명으로 생성
 
+필요 패키지 (requirements.txt):
+streamlit
+google-cloud-firestore
+google-cloud-storage
+google-auth
+pandas
+gspread
+"""
 from __future__ import annotations
-import os
-import io
 import json
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
+import io
+import time
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
-
-# Firebase Admin SDK
-from firebase_admin import credentials, firestore as fb_fs_admin, storage as fb_storage, initialize_app
-from google.cloud import firestore as gcf  # SERVER_TIMESTAMP, types
-
-# 표/CSV 처리
 import pandas as pd
+from datetime import datetime, timezone
 
-KST = ZoneInfo("Asia/Seoul")
-APP_TITLE = "수업·평가 운영 시스템"
+from google.oauth2 import service_account
+from google.cloud import firestore
+from google.cloud.firestore import Client as FirestoreClient
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from google.cloud import storage
 
-# -----------------------------
-# 초기화 / 공통 유틸
-# -----------------------------
+import gspread
 
+# ------------------------------
+# 초기 설정
+# ------------------------------
+st.set_page_config(page_title="수업·평가 관리", layout="wide")
+
+APP_TZ = "Asia/Seoul"  # 표기 목적(서버 로컬 시간 사용)
+MAX_PDF_BYTES = 10 * 1024 * 1024  # 10MB
+
+COL_SUBJECTS = "subjects"
+COL_CLASSES = "class_sections"
+COL_STUDENTS = "class_students"
+COL_LESSON_LOGS = "lesson_logs"
+COL_ATTENDANCE = "attendance"
+COL_EXPORTS = "exports"
+
+ATTENDANCE_STATES = ["present", "absent", "late", "excused"]
+WEEKDAYS = {1:"월",2:"화",3:"수",4:"목",5:"금",6:"토",7:"일"}
+
+# ------------------------------
+# Firebase 초기화
+# ------------------------------
 @st.cache_resource(show_spinner=False)
-def init_firebase():
-    """st.secrets["FIREBASE_KEY"]에서 서비스 계정 JSON을 읽어 Firebase Admin 초기화.
-    storageBucket 도 secrets에 포함되어 있어야 함.
-    """
-    try:
-        key = st.secrets.get("FIREBASE_KEY")
-        if key is None:
+def init_clients() -> Tuple[FirestoreClient, storage.Bucket, Dict[str, Any]]:
+    raw = st.secrets.get("FIREBASE_KEY", None)
+    if raw is None:
+        st.stop()
+    if isinstance(raw, str):
+        key = json.loads(raw)
+    else:
+        # SecretsToml contains a mapping
+        key = dict(raw)
+    required = ["project_id", "client_email", "private_key", "storageBucket"]
+    for k in required:
+        if k not in key:
+            st.error(f"FIREBASE_KEY에 '{k}'가 없습니다. Streamlit Secrets를 확인하세요.")
             st.stop()
-        if isinstance(key, str):
-            key_dict = json.loads(key)
-        else:
-            key_dict = dict(key)
+    creds = service_account.Credentials.from_service_account_info(key)
+    fs = firestore.Client(project=key["project_id"], credentials=creds)
+    storage_client = storage.Client(project=key["project_id"], credentials=creds)
+    bucket = storage_client.bucket(key["storageBucket"])
+    return fs, bucket, key
 
-        cred = credentials.Certificate(key_dict)
-        app = initialize_app(cred, {
-            "storageBucket": key_dict.get("storageBucket")
-        })
-        db = fb_fs_admin.client(app)
-        bucket = fb_storage.bucket(app=app)
-        return db, bucket
-    except Exception as e:
-        st.error(f"Firebase 초기화 오류: {e}")
-        raise
+fs, bucket, FIREBASE_INFO = init_clients()
 
+# ------------------------------
+# 유틸리티
+# ------------------------------
+def now_ts_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def to_kst(dt: Optional[datetime] = None) -> datetime:
-    dt = dt or datetime.utcnow()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-    return dt.astimezone(KST)
+def today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
+def rerun():
+    st.rerun()
 
-def validate_pdf(uploaded_file: Optional[st.runtime.uploaded_file_manager.UploadedFile]) -> Tuple[bool, Optional[str]]:
-    """PDF 확장자/MIME 확인 + 10MB 이하 용량 제한."""
-    if uploaded_file is None:
-        return True, None
+# 파일 검증: PDF & 사이즈
+def validate_pdf(uploaded: Optional[st.runtime.uploaded_file_manager.UploadedFile]) -> Tuple[bool, Optional[str]]:
+    if uploaded is None:
+        return False, "파일이 선택되지 않았습니다."
+    name = (uploaded.name or "").lower()
+    if not name.endswith(".pdf"):
+        return False, "PDF 파일만 업로드 가능합니다. (.pdf)"
     try:
-        # MIME 우선 확인
-        if uploaded_file.type not in ("application/pdf", "application/x-pdf"):
-            # 확장자 보조 확인
-            if not uploaded_file.name.lower().endswith(".pdf"):
-                return False, "PDF 파일만 업로드할 수 있습니다."
-        size = len(uploaded_file.getbuffer())
-        if size > 10 * 1024 * 1024:
-            return False, "파일 용량은 10MB 이하여야 합니다."
-        return True, None
-    except Exception as e:
-        return False, f"파일 확인 중 오류: {e}"
-
-
-# Firebase 리소스
-DB, BUCKET = init_firebase()
-
-# -----------------------------
-# 데이터 액세스 레이어 (간단 Repo)
-# -----------------------------
-
-# subjects (교과)
-
-def subjects_list(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    q = DB.collection("subjects")
-    filters = filters or {}
-    if "year" in filters:
-        q = q.where("year", "==", int(filters["year"]))
-    if "semester" in filters:
-        q = q.where("semester", "==", int(filters["semester"]))
-    if "name_kw" in filters and filters["name_kw"]:
-        # 간단 키워드 필터는 클라이언트 측에서 처리(소수 데이터 가정)
-        docs = q.order_by("year").order_by("semester").order_by("name").stream()
-        rows = [{"id": d.id, **d.to_dict()} for d in docs]
-        kw = str(filters["name_kw"]).strip()
-        return [r for r in rows if kw in r.get("name", "")]
-    docs = q.order_by("year").order_by("semester").order_by("name").stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
-
-
-def subject_get(doc_id: str) -> Optional[Dict[str, Any]]:
-    snap = DB.collection("subjects").document(doc_id).get()
-    if not snap.exists:
-        return None
-    return {"id": snap.id, **snap.to_dict()}
-
-
-def subject_create(name: str, year: int, semester: int, pdf: Optional[st.runtime.uploaded_file_manager.UploadedFile]):
-    doc_ref = DB.collection("subjects").document()
-    plan_meta = None
-    try:
-        # 먼저 문서 생성(파일 메타 빈 상태) — 실패 시 Storage 업로드 방지
-        doc_ref.set({
-            "name": name,
-            "year": int(year),
-            "semester": int(semester),
-            "plan": None,
-            "created_at": to_kst(),
-            "updated_at": to_kst(),
-        })
-        if pdf is not None:
-            plan_meta = _upload_subject_pdf(doc_ref.id, pdf)
-            doc_ref.update({"plan": plan_meta, "updated_at": to_kst()})
-        return doc_ref.id
-    except Exception as e:
-        # 보상: 업로드된 파일이 있었다면 삭제
-        if plan_meta and plan_meta.get("bucket_path"):
-            try:
-                BUCKET.blob(plan_meta["bucket_path"]).delete()
-            except Exception:
-                pass
-        raise e
-
-
-def subject_update(doc_id: str, name: str, year: int, semester: int, pdf: Optional[st.runtime.uploaded_file_manager.UploadedFile]):
-    doc_ref = DB.collection("subjects").document(doc_id)
-    current = doc_ref.get().to_dict() or {}
-    old_plan = (current or {}).get("plan")
-    doc_ref.update({
-        "name": name,
-        "year": int(year),
-        "semester": int(semester),
-        "updated_at": to_kst(),
-    })
-    if pdf is not None:
-        # 새 파일 업로드 후 문서 갱신, 실패 시 보상
-        new_meta = None
-        try:
-            new_meta = _upload_subject_pdf(doc_id, pdf)
-            doc_ref.update({"plan": new_meta, "updated_at": to_kst()})
-            # 구 파일 정리
-            if old_plan and old_plan.get("bucket_path"):
-                try:
-                    BUCKET.blob(old_plan["bucket_path"]).delete()
-                except Exception:
-                    pass
-        except Exception as e:
-            # 새 업로드 실패 시 보상 삭제
-            if new_meta and new_meta.get("bucket_path"):
-                try:
-                    BUCKET.blob(new_meta["bucket_path"]).delete()
-                except Exception:
-                    pass
-            raise e
-
-
-def subject_delete(doc_id: str) -> bool:
-    # 수업반 존재 검사(참조 정합성)
-    classes_q = DB.collection("classes").where("subject_id", "==", DB.collection("subjects").document(doc_id)).limit(1).stream()
-    has_class = any(True for _ in classes_q)
-    if has_class:
-        raise RuntimeError("해당 교과에 연결된 수업반이 있어 삭제할 수 없습니다.")
-    # PDF 삭제
-    subj = subject_get(doc_id)
-    if subj and subj.get("plan") and subj["plan"].get("bucket_path"):
-        try:
-            BUCKET.blob(subj["plan"]["bucket_path"]).delete()
-        except Exception:
-            pass
-    DB.collection("subjects").document(doc_id).delete()
-    return True
-
-
-def _upload_subject_pdf(subject_id: str, uploaded_file: st.runtime.uploaded_file_manager.UploadedFile) -> Dict[str, Any]:
-    ok, msg = validate_pdf(uploaded_file)
-    if not ok:
-        raise ValueError(msg or "PDF 유효성 검사를 통과하지 못했습니다.")
-    # 파일명 안전 처리
-    ts = to_kst().strftime("%Y%m%d-%H%M%S")
-    safe_name = uploaded_file.name.replace(" ", "_")
-    blob_path = f"subjects/{subject_id}/plans/{ts}__{safe_name}"
-    blob = BUCKET.blob(blob_path)
-    blob.upload_from_file(uploaded_file, content_type="application/pdf")
-    meta = {
-        "file_name": uploaded_file.name,
-        "file_size": len(uploaded_file.getbuffer()),
-        "content_type": "application/pdf",
-        "uploaded_at": to_kst(),
-        "bucket_path": blob_path,
-    }
-    # 서명 URL(1시간) — 실패해도 앱 동작에 영향 없도록
-    try:
-        url = blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
-        meta["url"] = url
+        size = uploaded.size if hasattr(uploaded, "size") else len(uploaded.getbuffer())
     except Exception:
-        meta["url"] = None
-    return meta
+        # fallback
+        size = len(uploaded.read())
+        uploaded.seek(0)
+    if size > MAX_PDF_BYTES:
+        return False, "파일 용량은 10MB 이하여야 합니다."
+    return True, None
 
+# Storage 업로드
+def upload_pdf_to_storage(subject_id: str, uploaded: st.runtime.uploaded_file_manager.UploadedFile) -> Tuple[str, str, int]:
+    path = f"subjects/{subject_id}/syllabus.pdf"
+    blob = bucket.blob(path)
+    uploaded.seek(0)
+    blob.upload_from_file(uploaded, content_type="application/pdf")
+    blob.cache_control = "public, max-age=3600"
+    blob.patch()
+    # 공개 URL은 퍼블릭 권한이 필요할 수 있음. 필요 시 서명 URL로 대체 가능.
+    url = blob.public_url
+    size = blob.size or 0
+    return path, url, size
 
-# classes (수업반)
-
-def classes_list(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    q = DB.collection("classes")
-    filters = filters or {}
-    if "year" in filters:
-        q = q.where("year", "==", int(filters["year"]))
-    if "semester" in filters:
-        q = q.where("semester", "==", int(filters["semester"]))
-    if "subject_id" in filters and filters["subject_id"]:
-        q = q.where("subject_id", "==", DB.collection("subjects").document(filters["subject_id"]))
-    docs = q.order_by("year").order_by("semester").order_by("class_code").stream()
-    rows = []
-    for d in docs:
-        data = d.to_dict()
-        # subject_name 보조(스냅샷 아님 — UI 편의)
-        subj_name = None
-        try:
-            subj_snap = data.get("subject_id").get() if data.get("subject_id") else None
-            if subj_snap and subj_snap.exists:
-                subj_name = subj_snap.to_dict().get("name")
-        except Exception:
-            pass
-        rows.append({"id": d.id, **data, "subject_name": subj_name})
-    return rows
-
-
-def class_get(doc_id: str) -> Optional[Dict[str, Any]]:
-    snap = DB.collection("classes").document(doc_id).get()
-    if not snap.exists:
-        return None
-    data = snap.to_dict()
-    subj_name = None
-    try:
-        s = data.get("subject_id").get() if data.get("subject_id") else None
-        if s and s.exists:
-            subj_name = s.to_dict().get("name")
-    except Exception:
-        pass
-    return {"id": snap.id, **data, "subject_name": subj_name}
-
-
-def class_exists(year: int, semester: int, subject_id: str, class_code: str) -> bool:
-    q = (DB.collection("classes")
-         .where("year", "==", int(year))
-         .where("semester", "==", int(semester))
-         .where("subject_id", "==", DB.collection("subjects").document(subject_id))
-         .where("class_code", "==", class_code)
-         .limit(1)
-         .stream())
-    return any(True for _ in q)
-
-
-def class_create(year: int, semester: int, subject_id: str, class_code: str, timetable: List[Dict[str, Any]]):
-    if class_exists(year, semester, subject_id, class_code):
-        raise RuntimeError("동일 학년도/학기/교과/수업반이 이미 존재합니다.")
-    doc_ref = DB.collection("classes").document()
-    doc_ref.set({
-        "year": int(year),
-        "semester": int(semester),
-        "subject_id": DB.collection("subjects").document(subject_id),
-        "class_code": class_code,
-        "timetable": timetable or [],
-        "created_at": to_kst(),
-        "updated_at": to_kst(),
-    })
+# Firestore 헬퍼
+def fs_add(collection: str, data: Dict[str, Any]) -> str:
+    doc_ref = fs.collection(collection).document()
+    data.setdefault("created_at", SERVER_TIMESTAMP)
+    data["updated_at"] = SERVER_TIMESTAMP
+    doc_ref.set(data)
     return doc_ref.id
 
-
-def class_update(doc_id: str, year: int, semester: int, subject_id: str, class_code: str, timetable: List[Dict[str, Any]]):
-    DB.collection("classes").document(doc_id).update({
-        "year": int(year),
-        "semester": int(semester),
-        "subject_id": DB.collection("subjects").document(subject_id),
-        "class_code": class_code,
-        "timetable": timetable or [],
-        "updated_at": to_kst(),
-    })
+def fs_update(collection: str, doc_id: str, data: Dict[str, Any]):
+    data["updated_at"] = SERVER_TIMESTAMP
+    fs.collection(collection).document(doc_id).set(data, merge=True)
 
 
-def class_delete(doc_id: str):
-    # 하위 subcollections 삭제(lessons, students, attendance)
-    class_ref = DB.collection("classes").document(doc_id)
-    # lessons
-    for d in class_ref.collection("lessons").stream():
-        d.reference.delete()
-    # students
-    for d in class_ref.collection("students").stream():
-        d.reference.delete()
-    # attendance
-    for d in class_ref.collection("attendance").stream():
-        d.reference.delete()
-    class_ref.delete()
+def fs_delete(collection: str, doc_id: str):
+    fs.collection(collection).document(doc_id).delete()
 
 
-# students (수업반 하위)
-
-def students_list(class_id: str) -> List[Dict[str, Any]]:
-    docs = DB.collection("classes").document(class_id).collection("students").order_by("student_no").stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
-
-
-def student_upsert(class_id: str, student_no: str, name: str):
-    ref = DB.collection("classes").document(class_id).collection("students").document(student_no)
-    now = to_kst()
-    ref.set({
-        "student_no": student_no,
-        "name": name,
-        "updated_at": now,
-        "created_at": ref.get().to_dict().get("created_at") if ref.get().exists else now,
-    })
-
-
-def student_delete(class_id: str, student_no: str):
-    DB.collection("classes").document(class_id).collection("students").document(student_no).delete()
-
-
-# lessons (진도)
-
-def lessons_list(class_id: str, date_from: Optional[date] = None, date_to: Optional[date] = None) -> List[Dict[str, Any]]:
-    col = DB.collection("classes").document(class_id).collection("lessons")
-    q = col
-    if date_from is not None:
-        q = q.where("date", ">=", date_from.strftime("%Y-%m-%d"))
-    if date_to is not None:
-        q = q.where("date", "<=", date_to.strftime("%Y-%m-%d"))
-    docs = q.order_by("date").order_by("period").stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
-
-
-def lesson_upsert(class_id: str, d: date, period: int, progress: str, note: str):
-    class_ref = DB.collection("classes").document(class_id)
-    key = f"{d.strftime('%Y-%m-%d')}-{int(period)}"
-    ref = class_ref.collection("lessons").document(key)
-    c = class_get(class_id) or {}
-    snapshot = {
-        "year": c.get("year"),
-        "semester": c.get("semester"),
-        "subject_name": c.get("subject_name"),
-        "class_code": c.get("class_code"),
-    }
-    now = to_kst()
-    ref.set({
-        "date": d.strftime("%Y-%m-%d"),
-        "date_ts": now,
-        "period": int(period),
-        "progress": progress,
-        "note": note or "",
-        "class_ref": class_ref,
-        "snapshot": snapshot,
-        "updated_at": now,
-        "created_at": ref.get().to_dict().get("created_at") if ref.get().exists else now,
-    })
-
-
-def lesson_delete(class_id: str, doc_id: str):
-    DB.collection("classes").document(class_id).collection("lessons").document(doc_id).delete()
-
-
-# attendance (출결)
-STATUS_LABELS = ["출석", "결석", "지각", "공결"]
-LABEL_TO_CODE = {"출석": "P", "결석": "A", "지각": "L", "공결": "E"}
-CODE_TO_LABEL = {v: k for k, v in LABEL_TO_CODE.items()}
-
-
-def attendance_list(class_id: str, d: date) -> List[Dict[str, Any]]:
-    col = DB.collection("classes").document(class_id).collection("attendance")
-    ds = d.strftime("%Y-%m-%d")
-    docs = col.where("date", "==", ds).stream()
-    return [{"id": doc.id, **doc.to_dict()} for doc in docs]
-
-
-def attendance_batch_upsert(class_id: str, d: date, rows: List[Dict[str, Any]]):
-    class_ref = DB.collection("classes").document(class_id)
-    c = class_get(class_id) or {}
-    snapshot = {
-        "year": c.get("year"),
-        "semester": c.get("semester"),
-        "subject_name": c.get("subject_name"),
-        "class_code": c.get("class_code"),
-    }
-    ds = d.strftime("%Y-%m-%d")
-    now = to_kst()
-    batch = DB.batch()
-    for r in rows:
-        student_no = str(r.get("student_no"))
-        key = f"{ds}-{student_no}"
-        ref = class_ref.collection("attendance").document(key)
-        data_old_snap = ref.get()
-        batch.set(ref, {
-            "date": ds,
-            "date_ts": now,
-            "student_no": student_no,
-            "student_name": r.get("name", ""),
-            "status": LABEL_TO_CODE.get(r.get("status_label"), "P"),
-            "note": r.get("note", ""),
-            "class_ref": class_ref,
-            "snapshot": snapshot,
-            "updated_at": now,
-            "created_at": data_old_snap.to_dict().get("created_at") if data_old_snap.exists else now,
-        })
-    batch.commit()
-
-
-# collection group 쿼리(대시보드)
-
-def cg_lessons_by_date(target_date: date) -> List[Dict[str, Any]]:
-    ds = target_date.strftime("%Y-%m-%d")
-    q = DB.collection_group("lessons").where("date", "==", ds)
+@st.cache_data(ttl=20, show_spinner=False)
+def get_subjects(year: int, term: str) -> List[Dict[str, Any]]:
+    q = fs.collection(COL_SUBJECTS).where("year", "==", int(year)).where("term", "==", str(term))
     docs = q.stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
+    rows = []
+    for d in docs:
+        r = d.to_dict()
+        r["id"] = d.id
+        rows.append(r)
+    rows.sort(key=lambda x: (x.get("name","")))
+    return rows
 
-
-def cg_attendance_by_date(target_date: date) -> List[Dict[str, Any]]:
-    ds = target_date.strftime("%Y-%m-%d")
-    q = DB.collection_group("attendance").where("date", "==", ds)
+@st.cache_data(ttl=20, show_spinner=False)
+def get_classes(year: int, term: str) -> List[Dict[str, Any]]:
+    q = fs.collection(COL_CLASSES).where("year", "==", int(year)).where("term", "==", str(term))
     docs = q.stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
+    rows = []
+    for d in docs:
+        x = d.to_dict(); x["id"] = d.id
+        rows.append(x)
+    rows.sort(key=lambda x: (x.get("class_name","")))
+    return rows
 
+@st.cache_data(ttl=20, show_spinner=False)
+def get_students(class_id: str) -> List[Dict[str, Any]]:
+    q = fs.collection(COL_STUDENTS).where("class_id", "==", class_id)
+    docs = q.stream()
+    rows = []
+    for d in docs:
+        x = d.to_dict(); x["id"] = d.id
+        rows.append(x)
+    rows.sort(key=lambda x: (x.get("student_no","")))
+    return rows
 
-# -----------------------------
-# UI: Dialogs (입력/수정 전용)
-# -----------------------------
+@st.cache_data(ttl=20, show_spinner=False)
+def get_lesson_logs_by_date(date_str: str) -> List[Dict[str, Any]]:
+    q = fs.collection(COL_LESSON_LOGS).where("date", "==", date_str)
+    docs = q.stream()
+    rows = []
+    for d in docs:
+        x = d.to_dict(); x["id"] = d.id
+        rows.append(x)
+    rows.sort(key=lambda x: (x.get("class_name",""), x.get("period",0)))
+    return rows
 
-@st.dialog("교과 추가/수정")
-def dialog_subject(default: Optional[Dict[str, Any]] = None):
-    default = default or {}
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("교과명", value=default.get("name", ""))
-    with col2:
-        year = st.number_input("학년도", step=1, value=int(default.get("year", date.today().year)))
-        semester = st.selectbox("학기", [1, 2], index=0 if int(default.get("semester", 1)) == 1 else 1)
+@st.cache_data(ttl=20, show_spinner=False)
+def get_attendance_by_date(date_str: str) -> List[Dict[str, Any]]:
+    q = fs.collection(COL_ATTENDANCE).where("date", "==", date_str)
+    docs = q.stream()
+    rows = []
+    for d in docs:
+        x = d.to_dict(); x["id"] = d.id
+        rows.append(x)
+    rows.sort(key=lambda x: (x.get("class_id",""), x.get("period",0), x.get("student_no","")))
+    return rows
 
-    pdf = st.file_uploader("수업·평가 계획서(PDF, ≤10MB)", type=["pdf"], accept_multiple_files=False)
+# 캐시 무효화 유틸
+def invalidate_subjects():
+    get_subjects.clear()
 
-    if st.button("저장", type="primary"):
-        try:
-            ok, msg = validate_pdf(pdf)
-            if not ok:
-                st.warning(msg)
-                st.stop()
-            if default.get("id"):
-                subject_update(default["id"], name, int(year), int(semester), pdf)
-            else:
-                subject_create(name, int(year), int(semester), pdf)
-            st.success("저장되었습니다.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
+def invalidate_classes():
+    get_classes.clear()
 
+def invalidate_students():
+    get_students.clear()
 
-@st.dialog("수업반 추가/수정")
-def dialog_class(subjects: List[Dict[str, Any]], default: Optional[Dict[str, Any]] = None):
-    default = default or {}
-    year = st.number_input("학년도", step=1, value=int(default.get("year", date.today().year)))
-    semester = st.selectbox("학기", [1, 2], index=0 if int(default.get("semester", 1)) == 1 else 1)
+def invalidate_lesson_logs():
+    get_lesson_logs_by_date.clear()
 
-    # 교과 선택
-    subj_options = {f"{s['name']} ({s['year']}/{s['semester']})": s["id"] for s in subjects}
-    default_subj_id = default.get("subject_id")
-    default_label = None
-    if default_subj_id:
-        for k, v in subj_options.items():
-            if v == (default_subj_id.id if hasattr(default_subj_id, 'id') else default_subj_id):
-                default_label = k
-                break
-    label = st.selectbox("교과", list(subj_options.keys()), index=list(subj_options.keys()).index(default_label) if default_label in subj_options else 0 if subj_options else None)
-    subject_id = subj_options[label] if subj_options else None
+def invalidate_attendance():
+    get_attendance_by_date.clear()
 
-    class_code = st.text_input("수업반(학반)", value=default.get("class_code", ""))
+# ------------------------------
+# 전역 필터(사이드바)
+# ------------------------------
+year = st.sidebar.number_input("학년도", min_value=2000, max_value=2100, value=datetime.now().year, step=1, key="filter_year")
+term = st.sidebar.selectbox("학기", ["1", "2"], index=0, key="filter_term")
+menu = st.sidebar.selectbox(
+    "메뉴",
+    [
+        "담당 교과 관리",
+        "수업(반) 관리",
+        "시간표(요일·교시) 설정",
+        "학생 관리 (반별)",
+        "진도·특기사항 관리 (반별)",
+        "일자별 진도·특기사항 조회 (전체 반)",
+        "출결 관리 (반·학생·일자별)",
+        "일자별 출결 조회 (전체 반)",
+        "스프레드시트 내보내기",
+        "설정/초기 점검",
+    ],
+    index=0,
+)
 
-    st.markdown("**요일·교시 등록** — 요일을 선택하고 교시를 콤마(,)로 구분해 입력 (예: 1,2,3)")
-    days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-    day_labels = {"Mon": "월", "Tue": "화", "Wed": "수", "Thu": "목", "Fri": "금"}
-    timetable_rows: List[Dict[str, Any]] = []
-    for dcode in days:
-        periods_text = st.text_input(f"{day_labels[dcode]}요일 교시", value=",")
-        periods = []
-        try:
-            periods = [int(x.strip()) for x in periods_text.split(",") if x.strip().isdigit()]
-        except Exception:
-            pass
-        if periods:
-            timetable_rows.append({"day": dcode, "periods": periods})
+st.title("수업·평가 관리")
+st.caption("앱 시간대: Asia/Seoul · 오늘: " + today_str())
 
-    if st.button("저장", type="primary"):
-        try:
-            if not subject_id:
-                st.warning("교과를 선택해 주세요.")
-                st.stop()
-            if default.get("id"):
-                class_update(default["id"], int(year), int(semester), subject_id, class_code, timetable_rows)
-            else:
-                class_create(int(year), int(semester), subject_id, class_code, timetable_rows)
-            st.success("저장되었습니다.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
+# ------------------------------
+# 공통 컴포넌트
+# ------------------------------
 
-
-@st.dialog("학생 추가/수정")
-def dialog_student(class_id: str, default: Optional[Dict[str, Any]] = None):
-    default = default or {}
-    student_no = st.text_input("학번", value=default.get("student_no", ""))
-    name = st.text_input("성명", value=default.get("name", ""))
-    if st.button("저장", type="primary"):
-        try:
-            if not student_no or not name:
-                st.warning("학번과 성명은 필수입니다.")
-                st.stop()
-            student_upsert(class_id, student_no, name)
-            st.success("저장되었습니다.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
-
-
-@st.dialog("진도 입력/수정")
-def dialog_lesson(class_id: str, default: Optional[Dict[str, Any]] = None):
-    default = default or {}
-    d = st.date_input("일자", value=default.get("date_dt", date.today()))
-    period = st.number_input("교시", min_value=1, max_value=20, step=1, value=int(default.get("period", 1)))
-    progress = st.text_area("진도", value=default.get("progress", ""))
-    note = st.text_area("특기사항", value=default.get("note", ""))
-    if st.button("저장", type="primary"):
-        try:
-            if not progress:
-                st.warning("진도 내용을 입력하세요.")
-                st.stop()
-            lesson_upsert(class_id, d, int(period), progress, note)
-            st.success("저장되었습니다.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
-
-
-@st.dialog("출결 저장")
-def dialog_attendance_save(class_id: str, d: date, pending_rows_key: str):
-    # pending_rows_key: session_state에 임시 저장된 출결 입력 키
-    rows = st.session_state.get(pending_rows_key, [])
-    st.write(f"총 {len(rows)}명 저장 예정")
-    if st.button("저장", type="primary"):
-        try:
-            attendance_batch_upsert(class_id, d, rows)
-            st.success("저장되었습니다.")
-            # 임시 상태 초기화
-            st.session_state.pop(pending_rows_key, None)
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
-
-
-# -----------------------------
-# UI: 메뉴 화면
-# -----------------------------
-
-def menu_dashboard():
-    st.header("대시보드 / 일자별 조회")
-    d = st.date_input("조회 일자", value=date.today())
-
-    tab1, tab2 = st.tabs(["진도·특기사항", "출결·특기사항"])
-
-    with tab1:
-        try:
-            rows = cg_lessons_by_date(d)
-            if not rows:
-                st.info("선택한 조건에 해당하는 진도 데이터가 없습니다.")
-            else:
-                df = pd.DataFrame(rows)
-                show_cols = ["date", "period", "snapshot", "progress", "note"]
-                for c in show_cols:
-                    if c not in df.columns:
-                        df[c] = None
-                df = df[show_cols].sort_values(["period"])  # 동일 일자 내 교시 정렬
-                st.dataframe(df, use_container_width=True)
-        except Exception as e:
-            st.error(f"조회 오류: {e}")
-
-    with tab2:
-        try:
-            rows = cg_attendance_by_date(d)
-            if not rows:
-                st.info("선택한 조건에 해당하는 출결 데이터가 없습니다.")
-            else:
-                # 요약: 반별 상태 카운트
-                df = pd.DataFrame(rows)
-                for c in ["snapshot", "status", "student_no", "student_name", "note"]:
-                    if c not in df.columns:
-                        df[c] = None
-                df["status_label"] = df["status"].map(CODE_TO_LABEL).fillna("출석")
-                # 반 식별자: 학년도/학기/교과/수업반 문자열
-                def class_key(snap):
-                    if not isinstance(snap, dict):
-                        return "-"
-                    return f"{snap.get('year')}/{snap.get('semester')} {snap.get('subject_name')} {snap.get('class_code')}"
-                df["class_key"] = df["snapshot"].apply(class_key)
-                summary = (df.groupby(["class_key", "status_label"]).size().unstack(fill_value=0)).reset_index()
-                st.subheader("반별 출결 요약")
-                st.dataframe(summary, use_container_width=True)
-
-                with st.expander("학생별 상세 보기"):
-                    st.dataframe(df[["class_key", "student_no", "student_name", "status_label", "note"]].sort_values(["class_key", "student_no"]))
-        except Exception as e:
-            st.error(f"조회 오류: {e}")
-
-
-def menu_subjects():
-    st.header("교과 관리")
-    c1, c2, c3 = st.columns([1,1,2])
-    with c1:
-        f_year = st.number_input("학년도 필터", step=1, value=int(date.today().year))
-    with c2:
-        f_sem = st.selectbox("학기 필터", [1,2])
-    with c3:
-        kw = st.text_input("교과명 검색(부분 일치)")
-
-    try:
-        rows = subjects_list({"year": f_year, "semester": f_sem, "name_kw": kw})
-    except Exception as e:
-        st.error(f"목록 조회 오류: {e}")
-        rows = []
-
-    st.button("교과 추가", on_click=lambda: dialog_subject({}))
-
-    if not rows:
+def subject_selectbox(label: str, year: int, term: str) -> Optional[Dict[str, Any]]:
+    subjects = get_subjects(year, term)
+    if not subjects:
         st.info("등록된 교과가 없습니다.")
-        return
-
-    for r in rows:
-        with st.container(border=True):
-            st.subheader(f"{r.get('name')} ({r.get('year')}/{r.get('semester')})")
-            plan = r.get("plan") or {}
-            c1, c2, c3, c4 = st.columns([2,1,1,1])
-            with c1:
-                if plan.get("file_name"):
-                    st.write(f"계획서: {plan.get('file_name')}")
-                    if plan.get("url"):
-                        st.markdown(f"[다운로드]({plan['url']})")
-                    else:
-                        st.caption("다운로드 링크 생성 실패 또는 만료")
-                else:
-                    st.caption("계획서 파일 없음")
-            with c2:
-                st.button("보기/수정", key=f"subj_edit_{r['id']}", on_click=lambda rr=r: dialog_subject(rr))
-            with c3:
-                st.button("PDF 교체", key=f"subj_pdf_{r['id']}", on_click=lambda rr=r: dialog_subject({"id": rr["id"], "name": rr["name"], "year": rr["year"], "semester": rr["semester"]}))
-            with c4:
-                if st.button("삭제", key=f"subj_del_{r['id']}"):
-                    try:
-                        subject_delete(r["id"])
-                        st.success("삭제되었습니다.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"삭제 실패: {e}")
-
-
-def menu_classes():
-    st.header("수업(반) 관리")
-    try:
-        subjects = subjects_list()
-    except Exception as e:
-        st.error(f"교과 조회 오류: {e}")
-        subjects = []
-
-    st.button("수업반 추가", on_click=lambda: dialog_class(subjects, {}))
-
-    try:
-        rows = classes_list()
-        if not rows:
-            st.info("등록된 수업반이 없습니다.")
-            return
-        for r in rows:
-            with st.container(border=True):
-                st.subheader(f"{r.get('year')}/{r.get('semester')} {r.get('subject_name')} - {r.get('class_code')}")
-                st.caption(f"시간표: {r.get('timetable')}")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.button("수정", key=f"class_edit_{r['id']}", on_click=lambda rr=r: dialog_class(subjects, rr))
-                with c2:
-                    st.button("삭제", key=f"class_del_{r['id']}", on_click=lambda rid=r['id']: _delete_class_confirm(rid))
-                with c3:
-                    st.empty()
-    except Exception as e:
-        st.error(f"수업반 목록 오류: {e}")
-
-
-def _delete_class_confirm(class_id: str):
-    with st.dialog("수업반 삭제 확인"):
-        st.warning("수업반 및 하위 데이터(학생/진도/출결)가 삭제됩니다.")
-        if st.button("저장", type="primary"):
-            try:
-                class_delete(class_id)
-                st.success("삭제되었습니다.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"삭제 실패: {e}")
-
-
-def _select_class_ui() -> Optional[str]:
-    rows = classes_list()
-    if not rows:
-        st.info("수업반이 없습니다. 먼저 수업반을 등록하세요.")
         return None
-    opts = {f"{r['year']}/{r['semester']} {r.get('subject_name')} - {r['class_code']}": r["id"] for r in rows}
-    label = st.selectbox("수업반 선택", list(opts.keys()))
-    return opts[label]
+    opts = {f"{s['name']} (Y{s['year']} T{s['term']})": s for s in subjects}
+    key = st.selectbox(label, list(opts.keys()))
+    return opts.get(key)
 
 
-def menu_students():
-    st.header("학생 관리 (수업반별)")
-    class_id = _select_class_ui()
-    if not class_id:
+def class_selectbox(label: str, year: int, term: str) -> Optional[Dict[str, Any]]:
+    classes = get_classes(year, term)
+    if not classes:
+        st.info("등록된 수업(반)이 없습니다.")
+        return None
+    opts = {f"{c['class_name']} · {c.get('subject_name','?')}": c for c in classes}
+    key = st.selectbox(label, list(opts.keys()))
+    return opts.get(key)
+
+
+# ------------------------------
+# 3.1 담당 교과 관리
+# ------------------------------
+
+def render_subjects():
+    st.header("담당 교과 관리")
+    subjects = get_subjects(year, term)
+    col_new, _ = st.columns([1,4])
+    with col_new:
+        if st.button("+ 교과 등록", use_container_width=True):
+            open_subject_dialog(None)
+
+    if not subjects:
+        st.info("등록된 교과가 없습니다. 우측 상단의 '+ 교과 등록' 버튼을 클릭하여 등록하세요.")
         return
 
-    c1, c2 = st.columns([1,1])
-    with c1:
-        st.button("학생 추가", on_click=lambda: dialog_student(class_id, {}))
-    with c2:
-        with st.popover("CSV 업로드"):
-            st.caption("헤더: student_no,name | UTF-8 권장 (CP949 자동 시도)")
-            file = st.file_uploader("CSV 파일", type=["csv"], accept_multiple_files=False)
-            if st.button("저장", type="primary") and file is not None:
+    df = pd.DataFrame([
+        {
+            "교과명": s.get("name",""),
+            "학년도": s.get("year",""),
+            "학기": s.get("term",""),
+            "PDF": "있음" if s.get("pdf_path") else "없음",
+            "등록일": s.get("created_at"),
+            "수정": "수정",
+            "삭제": "삭제",
+            "업로드/보기": "업로드/보기",
+            "_id": s.get("id"),
+        }
+        for s in subjects
+    ])
+    st.dataframe(df[["교과명","학년도","학기","PDF","등록일"]], use_container_width=True)
+
+    # 액션 버튼들(행 단위)
+    for s in subjects:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(f"수정: {s['name']}", key=f"sub_edit_{s['id']}"):
+                open_subject_dialog(s)
+        with c2:
+            if st.button(f"PDF 업로드/보기: {s['name']}", key=f"sub_pdf_{s['id']}"):
+                open_subject_pdf_dialog(s)
+        with c3:
+            if st.button(f"삭제: {s['name']}", key=f"sub_del_{s['id']}"):
                 try:
-                    df = _read_csv_flex(file)
-                    ok_cnt = 0
-                    for _, row in df.iterrows():
-                        sno = str(row.get("student_no", "")).strip()
-                        nm = str(row.get("name", "")).strip()
-                        if not sno or not nm:
-                            continue
-                        student_upsert(class_id, sno, nm)
-                        ok_cnt += 1
-                    st.success(f"업로드 완료: {ok_cnt}명 처리")
-                    st.rerun()
+                    fs_delete(COL_SUBJECTS, s['id'])
+                    invalidate_subjects()
+                    st.success("삭제되었습니다.")
+                    rerun()
                 except Exception as e:
-                    st.error(f"업로드 실패: {e}")
+                    st.error(f"삭제 실패: {e}")
 
-    rows = students_list(class_id)
+
+@st.dialog("교과 등록/수정")
+def open_subject_dialog(existing: Optional[Dict[str, Any]]):
+    name = st.text_input("교과명", value=existing.get("name","") if existing else "")
+    y = st.number_input("학년도", min_value=2000, max_value=2100, value=int(existing.get("year", year) if existing else year))
+    t = st.selectbox("학기", ["1","2"], index=(0 if (existing and str(existing.get("term"))=="1") or not existing else 1))
+
+    if st.button("저장", type="primary"):
+        if not name.strip():
+            st.error("교과명을 입력하세요.")
+            return
+        data = {
+            "name": name.strip(),
+            "year": int(y),
+            "term": str(t),
+        }
+        try:
+            if existing:
+                fs_update(COL_SUBJECTS, existing["id"], data)
+            else:
+                sid = fs_add(COL_SUBJECTS, data)
+            invalidate_subjects()
+            st.toast("저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
+
+
+@st.dialog("교과 PDF 업로드/보기")
+def open_subject_pdf_dialog(existing: Dict[str, Any]):
+    st.write(f"**교과명:** {existing.get('name')} · **학년도/학기:** {existing.get('year')}/{existing.get('term')}")
+    if existing.get("pdf_url"):
+        st.markdown(f"현재 PDF: [열기]({existing['pdf_url']})")
+    uploaded = st.file_uploader("PDF 업로드", type=["pdf"], accept_multiple_files=False)
+    if st.button("저장", type="primary"):
+        ok, msg = validate_pdf(uploaded)
+        if not ok:
+            st.error(msg)
+            return
+        try:
+            path, url, size = upload_pdf_to_storage(existing['id'], uploaded)
+            fs_update(COL_SUBJECTS, existing['id'], {
+                "pdf_path": path,
+                "pdf_url": url,
+                "pdf_size": int(size or 0),
+                "pdf_mime": "application/pdf",
+            })
+            invalidate_subjects()
+            st.toast("PDF 업로드 완료")
+            rerun()
+        except Exception as e:
+            st.error(f"업로드 실패: {e}")
+
+
+# ------------------------------
+# 3.2 수업(반) 관리 & 3.3 시간표 설정
+# ------------------------------
+
+def render_classes():
+    st.header("수업(반) 관리")
+    subjects = get_subjects(year, term)
+    if not subjects:
+        st.info("반을 등록하려면 먼저 담당 교과를 등록하세요.")
+    if st.button("+ 수업(반) 등록", use_container_width=True):
+        open_class_dialog(None, subjects)
+
+    classes = get_classes(year, term)
+    if not classes:
+        st.info("등록된 수업(반)이 없습니다.")
+        return
+
+    df = pd.DataFrame([
+        {
+            "반명": c.get("class_name",""),
+            "교과": c.get("subject_name",""),
+            "학년도": c.get("year",""),
+            "학기": c.get("term",""),
+            "학생수": c.get("student_count", 0),
+            "_id": c.get("id"),
+        } for c in classes
+    ])
+    st.dataframe(df[["반명","교과","학년도","학기","학생수"]], use_container_width=True)
+
+    for c in classes:
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            if st.button(f"수정: {c['class_name']}", key=f"cls_edit_{c['id']}"):
+                open_class_dialog(c, subjects)
+        with cc2:
+            if st.button(f"시간표 설정: {c['class_name']}", key=f"cls_sched_{c['id']}"):
+                open_schedule_dialog(c)
+        with cc3:
+            if st.button(f"삭제: {c['class_name']}", key=f"cls_del_{c['id']}"):
+                try:
+                    # 종속 데이터 삭제(학생, 진도, 출결)
+                    delete_class_cascade(c['id'])
+                    fs_delete(COL_CLASSES, c['id'])
+                    invalidate_classes(); invalidate_students(); invalidate_lesson_logs(); invalidate_attendance()
+                    st.success("반과 종속 데이터가 삭제되었습니다.")
+                    rerun()
+                except Exception as e:
+                    st.error(f"삭제 실패: {e}")
+
+
+def delete_class_cascade(class_id: str):
+    # 학생
+    studs = fs.collection(COL_STUDENTS).where("class_id","==",class_id).stream()
+    for d in studs:
+        d.reference.delete()
+    # 진도
+    logs = fs.collection(COL_LESSON_LOGS).where("class_id","==",class_id).stream()
+    for d in logs:
+        d.reference.delete()
+    # 출결
+    atts = fs.collection(COL_ATTENDANCE).where("class_id","==",class_id).stream()
+    for d in atts:
+        d.reference.delete()
+
+
+@st.dialog("수업(반) 등록/수정")
+def open_class_dialog(existing: Optional[Dict[str,Any]], subjects: List[Dict[str,Any]]):
+    if not subjects:
+        st.info("먼저 교과를 등록하세요.")
+        return
+    sub_opts = {f"{s['name']}": s for s in subjects}
+    default_idx = 0
+    if existing:
+        # find index
+        names = list(sub_opts.keys())
+        try:
+            default_idx = names.index(existing.get("subject_name",""))
+        except Exception:
+            default_idx = 0
+    sub_name = st.selectbox("교과 선택", list(sub_opts.keys()), index=default_idx)
+    class_name = st.text_input("수업 학반명(예: 1-3)", value=existing.get("class_name","") if existing else "")
+
+    y = st.number_input("학년도", min_value=2000, max_value=2100, value=int(existing.get("year", year) if existing else year))
+    t = st.selectbox("학기", ["1","2"], index=(0 if (existing and str(existing.get("term"))=="1") or not existing else 1))
+
+    if st.button("저장", type="primary"):
+        if not class_name.strip():
+            st.error("학반명을 입력하세요.")
+            return
+        s = sub_opts[sub_name]
+        payload = {
+            "subject_id": s['id'],
+            "subject_name": s['name'],
+            "year": int(y),
+            "term": str(t),
+            "class_name": class_name.strip(),
+        }
+        try:
+            if existing:
+                fs_update(COL_CLASSES, existing['id'], payload)
+            else:
+                fs_add(COL_CLASSES, payload)
+            invalidate_classes()
+            st.toast("저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
+
+
+@st.dialog("시간표(요일·교시) 설정")
+def open_schedule_dialog(class_doc: Dict[str,Any]):
+    st.write(f"**반:** {class_doc.get('class_name')} · **교과:** {class_doc.get('subject_name')}")
+    existing = class_doc.get("schedule", [])
+    df = pd.DataFrame(existing) if existing else pd.DataFrame(columns=["weekday","period"])  # weekday:int(1~7), period:int
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "weekday": st.column_config.NumberColumn("요일(1~7)", min_value=1, max_value=7, step=1),
+            "period": st.column_config.NumberColumn("교시", min_value=1, step=1),
+        },
+        key=f"sched_edit_{class_doc['id']}"
+    )
+    if st.button("저장", type="primary"):
+        # 유효성 & 중복 검사
+        try:
+            rows = edited.fillna(0).astype({"weekday":int,"period":int}).to_dict("records") if not edited.empty else []
+            seen = set()
+            valid_rows = []
+            for r in rows:
+                w, p = int(r.get("weekday",0)), int(r.get("period",0))
+                if not (1 <= w <= 7 and p >= 1):
+                    continue
+                key = (w,p)
+                if key in seen:
+                    continue
+                seen.add(key)
+                valid_rows.append({"weekday":w, "period":p})
+            fs_update(COL_CLASSES, class_doc['id'], {"schedule": valid_rows})
+            invalidate_classes()
+            st.toast("시간표가 저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
+
+
+# ------------------------------
+# 3.4 학생 관리 (반별)
+# ------------------------------
+
+def render_students():
+    st.header("학생 관리 (반별)")
+    cls = class_selectbox("반 선택", year, term)
+    if not cls:
+        return
+
+    st.subheader(f"학생 목록 · {cls['class_name']}")
+    if st.button("+ 학생 추가", use_container_width=True):
+        open_student_dialog(cls, None)
+
+    # CSV 업로드
+    with st.expander("CSV 업로드(학번,성명)"):
+        st.caption("CSV 예시: 첫 줄 헤더 '학번,성명' · 인코딩 UTF-8 또는 CP949")
+        sample = "학번,성명\n20250101,홍길동\n20250102,김철수\n"
+        st.download_button("CSV 템플릿 다운로드", data=sample.encode("utf-8"), file_name="students_template.csv", mime="text/csv")
+        up = st.file_uploader("CSV 선택", type=["csv"], accept_multiple_files=False)
+        strategy = st.selectbox("중복 정책", ["업서트(학번 기준 갱신)", "건너뛰기"])
+        if st.button("업로드 실행", type="primary"):
+            if up is None:
+                st.error("CSV 파일을 선택하세요.")
+            else:
+                try:
+                    text = up.read()
+                    for enc in ("utf-8-sig","utf-8","cp949"):
+                        try:
+                            df = pd.read_csv(io.BytesIO(text), encoding=enc)
+                            break
+                        except Exception:
+                            df = None
+                    if df is None:
+                        st.error("CSV 파싱 실패(인코딩 확인)")
+                    else:
+                        if set(df.columns) != set(["학번","성명"]):
+                            st.error("헤더가 '학번,성명' 이어야 합니다.")
+                        else:
+                            upsert = (strategy.startswith("업서트"))
+                            ok, fail, skip = bulk_import_students(cls['id'], df, upsert)
+                            invalidate_students()
+                            st.success(f"업로드 완료: 성공 {ok}, 실패 {fail}, 건너뜀 {skip}")
+                            rerun()
+                except Exception as e:
+                    st.error(f"업로드 오류: {e}")
+
+    # 목록 표시
+    students = get_students(cls['id'])
+    if not students:
+        st.info("이 반의 학생 정보가 없습니다.")
+        return
+    df = pd.DataFrame([{ "학번": s.get("student_no"), "성명": s.get("student_name"), "_id": s["id"] } for s in students])
+    st.dataframe(df[["학번","성명"]], use_container_width=True)
+
+    for s in students:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(f"수정: {s['student_no']} {s['student_name']}", key=f"stu_edit_{s['id']}"):
+                open_student_dialog(cls, s)
+        with c2:
+            if st.button(f"삭제: {s['student_no']}", key=f"stu_del_{s['id']}"):
+                try:
+                    fs_delete(COL_STUDENTS, s['id'])
+                    # 종속 출결 삭제(옵션)
+                    atts = fs.collection(COL_ATTENDANCE).where("student_id","==",s['id']).stream()
+                    for d in atts: d.reference.delete()
+                    invalidate_students(); invalidate_attendance()
+                    st.success("삭제되었습니다.")
+                    rerun()
+                except Exception as e:
+                    st.error(f"삭제 실패: {e}")
+
+
+def bulk_import_students(class_id: str, df: pd.DataFrame, upsert: bool) -> Tuple[int,int,int]:
+    ok = fail = skip = 0
+    for _, row in df.iterrows():
+        no = str(row.get("학번",""))
+        nm = str(row.get("성명","")).strip()
+        if not no or not nm:
+            fail += 1; continue
+        # 기존 존재?
+        q = fs.collection(COL_STUDENTS).where("class_id","==",class_id).where("student_no","==",no).limit(1).stream()
+        found = None
+        for d in q:
+            found = d
+        try:
+            if found:
+                if upsert:
+                    fs_update(COL_STUDENTS, found.id, {"student_name": nm})
+                    ok += 1
+                else:
+                    skip += 1
+            else:
+                fs_add(COL_STUDENTS, {"class_id": class_id, "student_no": no, "student_name": nm})
+                ok += 1
+        except Exception:
+            fail += 1
+    return ok, fail, skip
+
+
+@st.dialog("학생 등록/수정")
+def open_student_dialog(cls: Dict[str,Any], existing: Optional[Dict[str,Any]]):
+    st.write(f"**반:** {cls['class_name']}")
+    no = st.text_input("학번", value=existing.get("student_no","") if existing else "")
+    nm = st.text_input("성명", value=existing.get("student_name","") if existing else "")
+    if st.button("저장", type="primary"):
+        if not no.strip() or not nm.strip():
+            st.error("학번과 성명을 입력하세요.")
+            return
+        try:
+            if existing:
+                fs_update(COL_STUDENTS, existing['id'], {"student_no": no.strip(), "student_name": nm.strip()})
+            else:
+                # 중복 검사
+                q = fs.collection(COL_STUDENTS).where("class_id","==",cls['id']).where("student_no","==",no.strip()).limit(1).stream()
+                exists = any(True for _ in q)
+                if exists:
+                    st.error("이미 해당 학번이 존재합니다.")
+                    return
+                fs_add(COL_STUDENTS, {"class_id": cls['id'], "student_no": no.strip(), "student_name": nm.strip()})
+            invalidate_students()
+            st.toast("저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
+
+
+# ------------------------------
+# 3.5 진도·특기사항 관리 (반별)
+# ------------------------------
+
+def render_lesson_logs():
+    st.header("진도·특기사항 관리 (반별)")
+    cls = class_selectbox("반 선택", year, term)
+    if not cls:
+        return
+    date_val = st.date_input("일자", value=datetime.now())
+    period = st.number_input("교시", min_value=1, value=1, step=1)
+
+    # 목록 표시
+    date_str = date_val.strftime("%Y-%m-%d")
+    q = fs.collection(COL_LESSON_LOGS).where("class_id","==",cls['id']).where("date","==",date_str).stream()
+    rows = []
+    for d in q:
+        x = d.to_dict(); x['id'] = d.id; rows.append(x)
+    rows.sort(key=lambda x: x.get("period",0))
+
+    st.subheader(f"{cls['class_name']} · {date_str} 기록")
     if not rows:
-        st.info("학생이 없습니다. 추가해 주세요.")
-        return
-
-    df = pd.DataFrame(rows)[["student_no", "name"]]
-    st.dataframe(df, use_container_width=True)
-
-    # 개별 삭제 버튼
-    for r in rows:
-        st.button(f"삭제: {r['student_no']} {r['name']}", key=f"stu_del_{r['id']}", on_click=lambda rr=r: _student_delete_confirm(class_id, rr))
-
-
-def _student_delete_confirm(class_id: str, row: Dict[str, Any]):
-    with st.dialog("학생 삭제 확인"):
-        st.write(f"{row.get('student_no')} {row.get('name')} 삭제")
-        if st.button("저장", type="primary"):
-            try:
-                student_delete(class_id, row.get("student_no"))
-                st.success("삭제되었습니다.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"삭제 실패: {e}")
-
-
-def menu_lessons():
-    st.header("진도·특기사항 (수업반별)")
-    class_id = _select_class_ui()
-    if not class_id:
-        return
+        st.info("기록된 진도/특기사항이 없습니다.")
+    else:
+        df = pd.DataFrame([{ "교시": r.get("period"), "진도": r.get("progress",""), "특기사항": r.get("note",""), "_id": r['id']} for r in rows])
+        st.dataframe(df[["교시","진도","특기사항"]], use_container_width=True)
 
     c1, c2 = st.columns(2)
     with c1:
-        start_d = st.date_input("시작일", value=date.today() - timedelta(days=7))
+        if st.button("+ 기록 추가", use_container_width=True):
+            open_log_dialog(cls, None, date_str, int(period))
     with c2:
-        end_d = st.date_input("종료일", value=date.today())
+        if rows:
+            # 첫 행 수정 예시 버튼
+            for r in rows:
+                if st.button(f"수정: {r['period']}교시", key=f"log_edit_{r['id']}"):
+                    open_log_dialog(cls, r, date_str, int(period))
 
-    st.button("진도 추가", on_click=lambda: dialog_lesson(class_id, {}))
 
-    try:
-        rows = lessons_list(class_id, start_d, end_d)
-        if not rows:
-            st.info("해당 기간에 진도 데이터가 없습니다.")
+@st.dialog("진도·특기사항 등록/수정")
+def open_log_dialog(cls: Dict[str,Any], existing: Optional[Dict[str,Any]], date_default: str, period_default: int):
+    date_str = st.text_input("일자(YYYY-MM-DD)", value=(existing.get("date", date_default) if existing else date_default))
+    period = st.number_input("교시", min_value=1, value=int(existing.get("period", period_default) if existing else period_default), step=1)
+    progress = st.text_area("진도", value=existing.get("progress","") if existing else "")
+    note = st.text_area("특기사항", value=existing.get("note","") if existing else "")
+
+    if st.button("저장", type="primary"):
+        if not date_str:
+            st.error("일자를 입력하세요.")
             return
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df["date_dt"] = pd.to_datetime(df["date"])  # 표시용
-            st.dataframe(df[["date", "period", "progress", "note"]].sort_values(["date", "period"]).reset_index(drop=True), use_container_width=True)
-        # 행별 수정/삭제
-        for r in rows:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.button(f"수정: {r['date']} {r['period']}교시", key=f"lesson_edit_{r['id']}", on_click=lambda rr=r: dialog_lesson(class_id, {**rr, "date_dt": datetime.strptime(rr['date'], '%Y-%m-%d').date()}))
-            with c2:
-                if st.button(f"삭제: {r['date']} {r['period']}교시", key=f"lesson_del_{r['id']}"):
-                    try:
-                        lesson_delete(class_id, r["id"])
-                        st.success("삭제되었습니다.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"삭제 실패: {e}")
-    except Exception as e:
-        st.error(f"조회 오류: {e}")
+        payload = {
+            "class_id": cls['id'],
+            "class_name": cls.get('class_name',''),
+            "subject_id": cls.get('subject_id',''),
+            "date": date_str,
+            "period": int(period),
+            "progress": progress.strip(),
+            "note": note.strip(),
+        }
+        try:
+            # 중복키: class_id+date+period
+            q = fs.collection(COL_LESSON_LOGS).where("class_id","==",cls['id']).where("date","==",date_str).where("period","==",int(period)).limit(1).stream()
+            dup = None
+            for d in q: dup = d
+            if existing:
+                fs_update(COL_LESSON_LOGS, existing['id'], payload)
+            else:
+                if dup:
+                    fs_update(COL_LESSON_LOGS, dup.id, payload)
+                else:
+                    fs_add(COL_LESSON_LOGS, payload)
+            invalidate_lesson_logs()
+            st.toast("저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
 
 
-def menu_attendance():
-    st.header("출결·특기사항 (수업반별)")
-    class_id = _select_class_ui()
-    if not class_id:
+# ------------------------------
+# 3.6 일자별 진도·특기사항 조회 (전체 반)
+# ------------------------------
+
+def render_daily_logs():
+    st.header("일자별 진도·특기사항 조회 (전체 반)")
+    date_val = st.date_input("일자", value=datetime.now())
+    date_str = date_val.strftime("%Y-%m-%d")
+    rows = get_lesson_logs_by_date(date_str)
+    if not rows:
+        st.info("선택한 일자에 대한 진도/특기사항이 없습니다.")
         return
-
-    d = st.date_input("일자", value=date.today())
-
-    # 학생 목록 + 기존 출결 로드
-    students = students_list(class_id)
-    if not students:
-        st.info("학생이 없습니다. 먼저 학생을 등록하세요.")
-        return
-
-    existing = {a["student_no"]: a for a in attendance_list(class_id, d)}
-
-    # 일괄 기본값
-    default_all = st.selectbox("일괄 기본값 지정", STATUS_LABELS, index=0)
-
-    input_rows = []
-    st.write("학생별 출결 입력")
-    for s in students:
-        sno = s["student_no"]
-        sname = s["name"]
-        prev = existing.get(sno)
-        prev_label = CODE_TO_LABEL.get(prev.get("status")) if prev else default_all
-        c1, c2, c3 = st.columns([1,1,3])
-        with c1:
-            st.write(f"{sno}")
-        with c2:
-            st.write(sname)
-        with c3:
-            label = st.selectbox("상태", STATUS_LABELS, index=STATUS_LABELS.index(prev_label) if prev_label in STATUS_LABELS else 0, key=f"att_status_{sno}")
-            note = st.text_input("특기사항", value=(prev.get("note") if prev else ""), key=f"att_note_{sno}")
-        input_rows.append({"student_no": sno, "name": sname, "status_label": label, "note": note})
-
-    # 저장 다이얼로그 오픈
-    pending_key = f"pending_att_{class_id}_{d.isoformat()}"
-    st.session_state[pending_key] = input_rows
-    st.button("저장", type="primary", on_click=lambda: dialog_attendance_save(class_id, d, pending_key))
-
-
-def menu_settings():
-    st.header("설정/도움말")
-    # Firebase 연결 상태
-    try:
-        st.write("Firestore 연결: OK")
-        st.write(f"Storage 버킷: {BUCKET.name}")
-    except Exception as e:
-        st.error(f"Firebase 연결 오류: {e}")
-
-    # CSV 템플릿
-    st.subheader("CSV 템플릿(학생 업로드)")
-    sample = "student_no,name\n20231234,홍길동\n20231235,김영희\n"
-    st.download_button("템플릿 다운로드", sample.encode("utf-8"), file_name="students_template.csv", mime="text/csv")
-
-
-# -----------------------------
-# CSV 보조
-# -----------------------------
-
-def _read_csv_flex(file) -> pd.DataFrame:
-    """UTF-8 우선, 실패 시 CP949로 재시도."""
-    file.seek(0)
-    try:
-        return pd.read_csv(file)
-    except Exception:
-        file.seek(0)
-        return pd.read_csv(file, encoding="cp949")
-
-
-# -----------------------------
-# 메인 라우팅
-# -----------------------------
-
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-
-    menu = st.sidebar.radio("메뉴", [
-        "대시보드 / 일자별 조회",
-        "교과 관리",
-        "수업(반) 관리",
-        "학생 관리(수업반별)",
-        "진도·특기사항(수업반별)",
-        "출결·특기사항(수업반별)",
-        "설정/도움말",
+    df = pd.DataFrame([
+        {
+            "반": r.get("class_name",""),
+            "교과": r.get("subject_id",""),  # subject_name을 저장하려면 denorm 확장 가능
+            "교시": r.get("period",0),
+            "진도": r.get("progress",""),
+            "특기사항": r.get("note",""),
+        } for r in rows
     ])
+    st.dataframe(df.sort_values(["반","교시"]), use_container_width=True)
 
+
+# ------------------------------
+# 3.7 출결 관리 (반·학생·일자별)
+# ------------------------------
+
+def render_attendance():
+    st.header("출결 관리 (반·학생·일자별)")
+    cls = class_selectbox("반 선택", year, term)
+    if not cls:
+        return
+    date_val = st.date_input("일자", value=datetime.now())
+    period = st.number_input("교시", min_value=1, value=1, step=1)
+
+    if st.button("출결 입력/수정", type="primary"):
+        open_attendance_dialog(cls, date_val.strftime("%Y-%m-%d"), int(period))
+
+
+@st.dialog("출결 입력/수정")
+def open_attendance_dialog(cls: Dict[str,Any], date_str: str, period: int):
+    st.write(f"**반:** {cls['class_name']} · **일자:** {date_str} · **교시:** {period}")
+    students = get_students(cls['id'])
+    if not students:
+        st.info("학생 명부가 없습니다. 학생을 먼저 등록하세요.")
+        return
+    # 기존 출결 로드
+    q = fs.collection(COL_ATTENDANCE).where("class_id","==",cls['id']).where("date","==",date_str).where("period","==",int(period)).stream()
+    old = {(d.to_dict().get("student_id")): {**d.to_dict(), "id": d.id} for d in q}
+
+    # 편집용 DF
+    rows = []
+    for s in students:
+        cur = old.get(s['id'], {})
+        rows.append({
+            "student_id": s['id'],
+            "학번": s.get("student_no",""),
+            "성명": s.get("student_name",""),
+            "상태": cur.get("status","present"),
+            "특기사항": cur.get("remark",""),
+        })
+    df = pd.DataFrame(rows)
+    edited = st.data_editor(
+        df,
+        num_rows="fixed",
+        use_container_width=True,
+        column_config={
+            "student_id": st.column_config.TextColumn("student_id", disabled=True),
+            "학번": st.column_config.TextColumn("학번", disabled=True),
+            "성명": st.column_config.TextColumn("성명", disabled=True),
+            "상태": st.column_config.SelectboxColumn("상태", options=ATTENDANCE_STATES),
+            "특기사항": st.column_config.TextColumn("특기사항"),
+        },
+        hide_index=True,
+        key=f"att_edit_{cls['id']}_{date_str}_{period}"
+    )
+
+    # 일괄 설정
+    with st.expander("일괄 입력"):
+        state = st.selectbox("전체 상태 설정", ATTENDANCE_STATES)
+        if st.button("전체 적용"):
+            edited["상태"] = state
+            st.toast("전체 상태가 적용되었습니다. 필요 시 개별 행을 수정한 뒤 저장하세요.")
+
+    if st.button("저장", type="primary"):
+        try:
+            # 행 단위 저장
+            for _, r in edited.iterrows():
+                sid = r["student_id"]
+                payload = {
+                    "class_id": cls['id'],
+                    "student_id": sid,
+                    "student_no": str(r["학번"]),
+                    "student_name": str(r["성명"]),
+                    "date": date_str,
+                    "period": int(period),
+                    "status": str(r["상태"]),
+                    "remark": str(r.get("특기사항","")),
+                }
+                # upsert by (class_id,date,period,student_id)
+                existing = old.get(sid)
+                if existing:
+                    fs_update(COL_ATTENDANCE, existing['id'], payload)
+                else:
+                    fs_add(COL_ATTENDANCE, payload)
+            invalidate_attendance()
+            st.toast("출결이 저장되었습니다.")
+            rerun()
+        except Exception as e:
+            st.error(f"저장 실패: {e}")
+
+
+# ------------------------------
+# 3.8 일자별 출결 조회 (전체 반)
+# ------------------------------
+
+def render_daily_attendance():
+    st.header("일자별 출결 조회 (전체 반)")
+    date_val = st.date_input("일자", value=datetime.now())
+    date_str = date_val.strftime("%Y-%m-%d")
+    rows = get_attendance_by_date(date_str)
+    if not rows:
+        st.info("선택한 일자에 대한 출결 데이터가 없습니다.")
+        return
+    # 요약
+    summary = pd.Series([r.get("status","present") for r in rows]).value_counts()
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("출석", int(summary.get("present",0)))
+    s2.metric("결석", int(summary.get("absent",0)))
+    s3.metric("지각", int(summary.get("late",0)))
+    s4.metric("공결", int(summary.get("excused",0)))
+
+    df = pd.DataFrame([
+        {
+            "반": r.get("class_id",""),
+            "교시": r.get("period",0),
+            "학번": r.get("student_no",""),
+            "성명": r.get("student_name",""),
+            "상태": r.get("status",""),
+            "특기사항": r.get("remark",""),
+        } for r in rows
+    ])
+    st.dataframe(df.sort_values(["반","교시","학번"]), use_container_width=True)
+
+
+# ------------------------------
+# 3.9 스프레드시트 내보내기
+# ------------------------------
+
+def render_export():
+    st.header("스프레드시트 내보내기")
+    collections = [COL_SUBJECTS, COL_CLASSES, COL_STUDENTS, COL_LESSON_LOGS, COL_ATTENDANCE]
+    selected = st.multiselect("내보낼 컬렉션 선택", collections, default=collections)
+    default_title = f"Firestore Export {datetime.now().strftime('%Y%m%d-%H%M')}"
+    title = st.text_input("스프레드시트 제목", value=default_title)
+    if st.button("내보내기 실행", type="primary"):
+        if not selected:
+            st.error("컬렉션을 선택하세요.")
+        else:
+            try:
+                url = export_to_gsheet(selected, title)
+                # 로그 저장(선택)
+                fs_add(COL_EXPORTS, {"title": title, "collections": selected, "spreadsheet_url": url})
+                st.success("내보내기 완료")
+                st.markdown(f"스프레드시트 열기: [{url}]({url})")
+            except Exception as e:
+                st.error(f"내보내기 실패: {e}")
+
+
+def export_to_gsheet(collections: List[str], title: str) -> str:
+    # gspread 인증: 서비스 계정 정보 사용
+    creds = service_account.Credentials.from_service_account_info(FIREBASE_INFO, scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    gc = gspread.authorize(creds)
+    sh = gc.create(title)
+    # 각 컬렉션을 별도 워크시트로
+    for col in collections:
+        ws = None
+        # gspread 기본 시트가 하나 존재 -> 첫 시트를 재사용 또는 새 시트 추가
+        try:
+            ws = sh.add_worksheet(title=col, rows=1, cols=1)
+        except Exception:
+            # 동일 이름 시트가 있으면 고유 이름 보정
+            ws = sh.add_worksheet(title=f"{col}_{int(time.time())}", rows=1, cols=1)
+        # 데이터 로드
+        docs = fs.collection(col).stream()
+        rows = []
+        for d in docs:
+            x = d.to_dict(); x["id"] = d.id; rows.append(x)
+        if rows:
+            df = pd.DataFrame(rows)
+            values = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
+            ws.update("A1", values)
+        else:
+            ws.update("A1", [["(empty)"]])
+    # 기본 첫 시트가 비어 있으면 삭제
     try:
-        if menu == "대시보드 / 일자별 조회":
-            menu_dashboard()
-        elif menu == "교과 관리":
-            menu_subjects()
-        elif menu == "수업(반) 관리":
-            menu_classes()
-        elif menu == "학생 관리(수업반별)":
-            menu_students()
-        elif menu == "진도·특기사항(수업반별)":
-            menu_lessons()
-        elif menu == "출결·특기사항(수업반별)":
-            menu_attendance()
-        elif menu == "설정/도움말":
-            menu_settings()
-    except Exception as e:
-        st.error(f"예상치 못한 오류가 발생했습니다: {e}")
+        default_ws = sh.sheet1
+        if default_ws.title not in collections:
+            sh.del_worksheet(default_ws)
+    except Exception:
+        pass
+    # 서비스 계정 소유. 필요 시 공유는 별도 처리. 여기서는 URL만 반환
+    return sh.url
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------------
+# 3.10 설정/초기 점검
+# ------------------------------
+
+def render_settings():
+    st.header("설정/초기 점검")
+    st.write("**Project ID:**", FIREBASE_INFO.get("project_id"))
+    st.write("**Storage Bucket:**", FIREBASE_INFO.get("storageBucket"))
+    st.write("**Service Account:**", FIREBASE_INFO.get("client_email"))
+
+    if st.button("Firestore 연결 점검"):
+        try:
+            _ = list(fs.collections())
+            st.success("Firestore 연결 OK")
+        except Exception as e:
+            st.error(f"Firestore 연결 실패: {e}")
+
+    if st.button("Storage 연결 점검"):
+        try:
+            _ = list(bucket.list_blobs(max_results=1))
+            st.success("Storage 연결 OK")
+        except Exception as e:
+            st.error(f"Storage 연결 실패: {e}")
+
+    with st.expander("CSV 템플릿 다운로드"):
+        sample = "학번,성명\n20250101,홍길동\n20250102,김철수\n"
+        st.download_button("학생 CSV 템플릿", data=sample.encode("utf-8"), file_name="students_template.csv", mime="text/csv")
+
+
+# ------------------------------
+# 라우팅
+# ------------------------------
+if menu == "담당 교과 관리":
+    render_subjects()
+elif menu == "수업(반) 관리":
+    render_classes()
+elif menu == "시간표(요일·교시) 설정":
+    # 시간표 설정은 수업(반) 관리에서 각 반의 버튼으로 진입하도록 구성했으나,
+    # 이 메뉴에서는 안내만 제공합니다.
+    st.header("시간표(요일·교시) 설정")
+    st.info("수업(반) 관리에서 각 반의 '시간표 설정' 버튼을 눌러 편집하세요.")
+elif menu == "학생 관리 (반별)":
+    render_students()
+elif menu == "진도·특기사항 관리 (반별)":
+    render_lesson_logs()
+elif menu == "일자별 진도·특기사항 조회 (전체 반)":
+    render_daily_logs()
+elif menu == "출결 관리 (반·학생·일자별)":
+    render_attendance()
+elif menu == "일자별 출결 조회 (전체 반)":
+    render_daily_attendance()
+elif menu == "스프레드시트 내보내기":
+    render_export()
+elif menu == "설정/초기 점검":
+    render_settings()
+
+# 끝

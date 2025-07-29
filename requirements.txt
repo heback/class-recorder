@@ -3,3 +3,6 @@ firebase-admin
 pandas
 google-cloud-storage
 google-cloud-firestore
+google-auth
+gspread
+oauth2client
