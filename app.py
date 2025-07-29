@@ -867,63 +867,164 @@ def render_daily_attendance():
 # 3.9 스프레드시트 내보내기
 # ------------------------------
 
-def render_export():
-    st.header("스프레드시트 내보내기")
-    collections = [COL_SUBJECTS, COL_CLASSES, COL_STUDENTS, COL_LESSON_LOGS, COL_ATTENDANCE]
-    selected = st.multiselect("내보낼 컬렉션 선택", collections, default=collections)
-    default_title = f"Firestore Export {datetime.now().strftime('%Y%m%d-%H%M')}"
-    title = st.text_input("스프레드시트 제목", value=default_title)
-    if st.button("내보내기 실행", type="primary"):
-        if not selected:
-            st.error("컬렉션을 선택하세요.")
-        else:
-            try:
-                url = export_to_gsheet(selected, title)
-                # 로그 저장(선택)
-                fs_add(COL_EXPORTS, {"title": title, "collections": selected, "spreadsheet_url": url})
-                st.success("내보내기 완료")
-                st.markdown(f"스프레드시트 열기: [{url}]({url})")
-            except Exception as e:
-                st.error(f"내보내기 실패: {e}")
+import zipfile
 
+# 2) 헬퍼: 공통 로우 로드
 
-def export_to_gsheet(collections: List[str], title: str) -> str:
-    # gspread 인증: 서비스 계정 정보 사용
+def fetch_collection_rows(col: str):
+    docs = fs.collection(col).stream()
+    rows = []
+    for d in docs:
+        x = d.to_dict(); x["id"] = d.id
+        rows.append(x)
+    return rows
+
+# 3) 대안: CSV ZIP 생성(Drive 미사용)
+
+def export_to_csv_zip(collections, title_prefix="Firestore Export"):
+    ts = datetime.now().strftime("%Y%m%d-%H%M")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for col in collections:
+            rows = fetch_collection_rows(col)
+            if rows:
+                df = pd.DataFrame(rows)
+                csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+            else:
+                csv_bytes = "(empty)\n".encode("utf-8")
+            z.writestr(f"{col}.csv", csv_bytes)
+    buf.seek(0)
+    filename = f"{title_prefix}_{ts}.zip"
+    return buf, filename
+
+# 4) 시트 보조: 워크시트 생성/덮어쓰기
+
+def upsert_worksheet(sh, title: str, overwrite: bool = True):
+    import gspread
+    if overwrite:
+        try:
+            ws = sh.worksheet(title)
+            ws.clear()
+            return ws
+        except gspread.exceptions.WorksheetNotFound:
+            return sh.add_worksheet(title=title, rows=1, cols=1)
+    else:
+        # 같은 이름 피하고 새로 추가
+        return sh.add_worksheet(title=f"{title}_{int(time.time())}", rows=1, cols=1)
+
+# 5) 개선된 Sheets 내보내기: '새로 만들기' 또는 '기존 파일 사용'
+
+def export_to_gsheet(collections, title: str, mode: str = "create", spreadsheet_id: str | None = None, overwrite: bool = True) -> str:
     creds = service_account.Credentials.from_service_account_info(FIREBASE_INFO, scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ])
     gc = gspread.authorize(creds)
-    sh = gc.create(title)
-    # 각 컬렉션을 별도 워크시트로
+    if mode == "create":
+        sh = gc.create(title)
+    else:
+        if not spreadsheet_id:
+            raise ValueError("스프레드시트 ID가 필요합니다.")
+        sh = gc.open_by_key(spreadsheet_id)
+
     for col in collections:
-        ws = None
-        # gspread 기본 시트가 하나 존재 -> 첫 시트를 재사용 또는 새 시트 추가
-        try:
-            ws = sh.add_worksheet(title=col, rows=1, cols=1)
-        except Exception:
-            # 동일 이름 시트가 있으면 고유 이름 보정
-            ws = sh.add_worksheet(title=f"{col}_{int(time.time())}", rows=1, cols=1)
-        # 데이터 로드
-        docs = fs.collection(col).stream()
-        rows = []
-        for d in docs:
-            x = d.to_dict(); x["id"] = d.id; rows.append(x)
+        ws = upsert_worksheet(sh, col, overwrite=overwrite)
+        rows = fetch_collection_rows(col)
         if rows:
             df = pd.DataFrame(rows)
             values = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
             ws.update("A1", values)
         else:
             ws.update("A1", [["(empty)"]])
-    # 기본 첫 시트가 비어 있으면 삭제
+
+    # 기본 첫 시트 제거(필요 시)
     try:
         default_ws = sh.sheet1
-        if default_ws.title not in collections:
+        # create가 아닌 경우에는 기본 시트가 아닐 수 있음 — 보호적 처리
+        if mode == "create" and default_ws.title not in collections:
             sh.del_worksheet(default_ws)
     except Exception:
         pass
-    # 서비스 계정 소유. 필요 시 공유는 별도 처리. 여기서는 URL만 반환
+
     return sh.url
+
+# 6) UI: render_export() 교체
+
+def render_export():
+    st.header("스프레드시트 내보내기")
+    collections = [COL_SUBJECTS, COL_CLASSES, COL_STUDENTS, COL_LESSON_LOGS, COL_ATTENDANCE]
+    selected = st.multiselect("내보낼 컬렉션 선택", collections, default=collections, key="export_cols_v2")
+
+    mode_label = st.radio(
+        "대상 선택",
+        (
+            "기존 스프레드시트 사용(추천)",  # 소유자=내 계정 → 내 드라이브 용량 사용
+            "새로 만들기(서비스 계정 소유)",   # 서비스 계정 드라이브 용량 사용
+        ),
+        horizontal=False,
+        index=0,
+        key="export_mode_v2",
+    )
+    use_existing = mode_label.startswith("기존")
+
+    spreadsheet_id = None
+    overwrite = True
+    if use_existing:
+        st.info(
+            "1) Google Drive에서 빈 스프레드시트를 만들고, 2) **서비스 계정 이메일**에 편집 권한을 공유하세요 → "
+            f"**{FIREBASE_INFO.get('client_email','(service-account)')}**\n"
+            "3) 아래에 '스프레드시트 ID'를 입력합니다. (문서 URL의 /d/와 /edit 사이 문자열)",
+        )
+        spreadsheet_id = st.text_input("스프레드시트 ID", value="", key="export_sheet_id")
+        overwrite = st.checkbox("동일 시트명 덮어쓰기(기존 내용 지움)", value=True, key="export_overwrite")
+    else:
+        default_title = f"Firestore Export {datetime.now().strftime('%Y%m%d-%H%M')}"
+        st.caption("서비스 계정이 파일을 소유합니다. 서비스 계정의 Drive 용량이 부족하면 실패할 수 있습니다.")
+        st.write("**생성될 제목**: ", default_title)
+
+    title = st.text_input("작업 제목(로그/CSV 파일명 용)", value=f"Firestore Export {datetime.now().strftime('%Y%m%d-%H%M')}", key="export_title_v2")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Sheets로 내보내기", type="primary", key="btn_export_v2"):
+            if not selected:
+                st.error("컬렉션을 선택하세요.")
+            else:
+                try:
+                    url = export_to_gsheet(
+                        selected,
+                        title=title,
+                        mode=("existing" if use_existing else "create"),
+                        spreadsheet_id=spreadsheet_id,
+                        overwrite=overwrite,
+                    )
+                    fs_add(COL_EXPORTS, {"title": title, "collections": selected, "spreadsheet_url": url})
+                    st.success("내보내기 완료")
+                    st.markdown(f"스프레드시트 열기: [{url}]({url})")
+                except Exception as e:
+                    from gspread.exceptions import APIError
+                    if isinstance(e, APIError):
+                        s = str(e).lower()
+                        if ("quota" in s) or ("exceeded" in s) or ("403" in s):
+                            st.error(
+                                "Drive 저장공간(소유자)의 용량 한도를 초과해 실패했습니다. "
+                                "대응 방법: (1) '기존 스프레드시트 사용'으로 전환해 **내 계정이 소유한 시트에 쓰기**, "
+                                "또는 (2) 아래 'CSV ZIP 다운로드'를 사용하세요."
+                            )
+                        else:
+                            st.error(f"내보내기 실패: {e}")
+                    else:
+                        st.error(f"내보내기 실패: {e}")
+
+    with c2:
+        if st.button("CSV ZIP 다운로드(Drive 미사용)", key="btn_export_zip_v2"):
+            if not selected:
+                st.error("컬렉션을 선택하세요.")
+            else:
+                buf, filename = export_to_csv_zip(selected, title_prefix=title)
+                st.download_button("ZIP 저장", data=buf, file_name=f"{filename}", mime="application/zip", key="btn_zip_download_v2")
+
+# --- END PATCH ---
 
 
 # ------------------------------
