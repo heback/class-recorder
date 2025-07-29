@@ -10,7 +10,6 @@
 # - 단일 파일 구성(app.py)
 # --------------------------------------------------------------
 
-from __future__ import annotations
 import json
 import time
 import io
