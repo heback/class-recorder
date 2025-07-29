@@ -14,7 +14,7 @@ def init_firebase():
 
             cred = credentials.Certificate(firebase_config)
             firebase_admin.initialize_app(cred, {
-                "storageBucket": st.secrets["storageBucket"]
+                "storageBucket": firebase_config["storageBucket"]
             })
         return firestore.client(), storage.bucket()
     except Exception as e:
