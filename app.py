@@ -216,7 +216,8 @@ def class_dialog(courses, class_id=None):
             default_data.get("course_id")) if default_data.get(
             "course_id") in course_ids else 0
         selected_course_id = st.selectbox("교과 선택", course_ids,
-                                          format_func=lambda x: courses[x],
+                                          format_func=lambda x: courses.get(x,
+                                                                            "이름 없음"),
                                           index=default_course_index)
 
         class_name = st.text_input("학급명 (예: 1학년 1반)",
@@ -228,7 +229,7 @@ def class_dialog(courses, class_id=None):
         schedule_data = []
         for day in days:
             periods_for_day = [item['period'] for item in default_schedule if
-                               item['day'] == day]
+                               item.get('day') == day]
             selected_periods = st.multiselect(f"{day}요일 수업 교시",
                                               list(range(1, 9)),
                                               default=periods_for_day)
@@ -240,11 +241,13 @@ def class_dialog(courses, class_id=None):
             if not class_name:
                 st.warning("학급명을 입력해주세요.")
             else:
-                course_doc = db.collection("courses").document(
-                    selected_course_id).get().to_dict()
+                course_doc_snap = db.collection("courses").document(
+                    selected_course_id).get()
+                course_doc = course_doc_snap.to_dict() if course_doc_snap.exists else {}
+
                 data = {
                     "course_id": selected_course_id,
-                    "course_name": courses[selected_course_id],
+                    "course_name": courses.get(selected_course_id, "이름 없음"),
                     "year": course_doc.get("year"),
                     "semester": course_doc.get("semester"),
                     "class_name": class_name,
@@ -266,7 +269,8 @@ def class_management():
     st.markdown("담당 교과에 대한 학급을 등록하고 관리합니다.")
 
     courses_ref = db.collection("courses").stream()
-    courses = {doc.id: doc.to_dict()['name'] for doc in courses_ref}
+    courses = {doc.id: doc.to_dict().get('name', f'이름 없는 교과 (ID:{doc.id})') for
+               doc in courses_ref}
 
     if not courses:
         st.warning("먼저 '교과 관리' 메뉴에서 교과를 추가해주세요.")
@@ -350,7 +354,7 @@ def student_management():
 
     classes_ref = db.collection("classes").stream()
     classes_dict = {
-        doc.id: f"{doc.to_dict()['class_name']} ({doc.to_dict()['course_name']})"
+        doc.id: f"{doc.to_dict().get('class_name', '이름 없음')} ({doc.to_dict().get('course_name', '')})"
         for doc in classes_ref}
 
     if not classes_dict:
@@ -359,10 +363,11 @@ def student_management():
 
     selected_class_id = st.selectbox("수업 반 선택",
                                      options=list(classes_dict.keys()),
-                                     format_func=lambda x: classes_dict[x])
+                                     format_func=lambda x: classes_dict.get(x,
+                                                                            "이름 없음"))
 
     if selected_class_id:
-        st.subheader(f"'{classes_dict[selected_class_id]}' 학생 목록")
+        st.subheader(f"'{classes_dict.get(selected_class_id)}' 학생 목록")
 
         students_ref = db.collection("classes").document(
             selected_class_id).collection("students").order_by(
@@ -468,7 +473,7 @@ def progress_management():
 
     classes_ref = db.collection("classes").stream()
     classes_dict = {
-        doc.id: f"{doc.to_dict()['class_name']} ({doc.to_dict()['course_name']})"
+        doc.id: f"{doc.to_dict().get('class_name', '이름 없음')} ({doc.to_dict().get('course_name', '')})"
         for doc in classes_ref}
 
     if not classes_dict:
@@ -479,7 +484,8 @@ def progress_management():
     with col1:
         selected_class_id = st.selectbox("수업 반 선택",
                                          options=list(classes_dict.keys()),
-                                         format_func=lambda x: classes_dict[x])
+                                         format_func=lambda x: classes_dict.get(
+                                             x, "이름 없음"))
     with col2:
         selected_date = st.date_input("날짜 선택", datetime.now())
 
@@ -528,7 +534,7 @@ def attendance_management():
 
     classes_ref = db.collection("classes").stream()
     classes_dict = {
-        doc.id: f"{doc.to_dict()['class_name']} ({doc.to_dict()['course_name']})"
+        doc.id: f"{doc.to_dict().get('class_name', '이름 없음')} ({doc.to_dict().get('course_name', '')})"
         for doc in classes_ref}
 
     if not classes_dict:
@@ -539,7 +545,8 @@ def attendance_management():
     with col1:
         selected_class_id = st.selectbox("수업 반 선택",
                                          options=list(classes_dict.keys()),
-                                         format_func=lambda x: classes_dict[x])
+                                         format_func=lambda x: classes_dict.get(
+                                             x, "이름 없음"))
     with col2:
         selected_date = st.date_input("날짜 선택", datetime.now())
 
@@ -558,8 +565,8 @@ def attendance_management():
         attendance_ref = db.collection("attendance").where("class_id", "==",
                                                            selected_class_id).where(
             "date", "==", date_str).stream()
-        attendance_data = {doc.to_dict()['student_id']: doc.to_dict() for doc in
-                           attendance_ref}
+        attendance_data = {doc.to_dict().get('student_id'): doc.to_dict() for
+                           doc in attendance_ref}
 
         st.subheader(f"'{date_str}' 출결 현황")
 
@@ -694,12 +701,13 @@ def data_backup():
 
                 all_students = []
                 for class_doc in all_classes:
+                    class_data = class_doc.to_dict()
                     students = db.collection("classes").document(
                         class_doc.id).collection("students").stream()
                     for student in students:
                         student_data = student.to_dict()
                         student_data['class_id'] = class_doc.id
-                        student_data['class_name'] = class_doc.to_dict().get(
+                        student_data['class_name'] = class_data.get(
                             'class_name')
                         all_students.append(student_data)
 
@@ -722,13 +730,13 @@ def data_backup():
 
                 all_progress = []
                 for class_doc in all_classes:
+                    class_data = class_doc.to_dict()
                     progress_items = db.collection("classes").document(
                         class_doc.id).collection("progress").stream()
                     for item in progress_items:
                         item_data = item.to_dict()
                         item_data['class_id'] = class_doc.id
-                        item_data['class_name'] = class_doc.to_dict().get(
-                            'class_name')
+                        item_data['class_name'] = class_data.get('class_name')
                         all_progress.append(item_data)
 
                 if all_progress:
