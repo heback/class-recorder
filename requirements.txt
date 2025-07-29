@@ -1,1 +1,5 @@
 streamlit
+firebase-admin
+pandas
+google-cloud-storage
+google-cloud-firestore
