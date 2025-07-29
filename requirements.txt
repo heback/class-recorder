@@ -1,8 +1,8 @@
 streamlit
 firebase-admin
-pandas
-google-cloud-storage
 google-cloud-firestore
-google-auth
+google-cloud-storage
+pandas
 gspread
+gspread-dataframe
 oauth2client
