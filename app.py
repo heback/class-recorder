@@ -9,7 +9,7 @@ import os, json
 
 # Firebase 초기화
 if not firebase_admin._apps:
-    firebase_key = st.secrets["FIREBASE_KEY"]
+    firebase_key = dict(st.secrets["FIREBASE_KEY"])
     cred = credentials.Certificate(firebase_key)
     firebase_admin.initialize_app(cred, {
         'storageBucket': firebase_key["storageBucket"]
