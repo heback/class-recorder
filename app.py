@@ -4,11 +4,12 @@ from firebase_admin import credentials, firestore, storage, auth
 import pandas as pd
 import datetime
 import tempfile
-import csv
+import os, json
 
 # Firebase 초기화
 if not firebase_admin._apps:
-    cred = credentials.Certificate("firebase_key.json")
+    firebase_key = json.loads(os.environ["FIREBASE_KEY"])
+    cred = credentials.Certificate(firebase_key)
     firebase_admin.initialize_app(cred, {
         'storageBucket': 'class-recorder-6ce3f.firebasestorage.app'
     })
