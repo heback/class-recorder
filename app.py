@@ -6,9 +6,6 @@ import datetime
 import tempfile
 import os, json
 
-
-
-
 # Firebase 초기화
 if not firebase_admin._apps:
     firebase_key = json.loads(os.environ["FIREBASE_KEY"])
