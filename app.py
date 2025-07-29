@@ -28,8 +28,6 @@ def init_firebase():
         if not firebase_admin._apps:
             # st.secrets["firebase"]를 dict로 변환하고 private_key의 \n 처리
             firebase_config = dict(st.secrets["FIREBASE_KEY"])
-            if "private_key" in firebase_config:
-                firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
             cred = credentials.Certificate(firebase_config)
             firebase_admin.initialize_app(cred, {
                 'storageBucket': st.secrets["storageBucket"]
