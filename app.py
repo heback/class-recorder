@@ -9,7 +9,6 @@ def init_firebase():
     try:
         if not firebase_admin._apps:
             firebase_config = dict(st.secrets["FIREBASE_KEY"])
-            # private_key의 줄바꿈 문자 처리
             if "private_key" in firebase_config:
                 firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
 
@@ -21,22 +20,24 @@ def init_firebase():
     except Exception as e:
         st.error(f"Firebase 초기화 실패: {e}")
         return None, None
-st.write("1")
+
 db, bucket = init_firebase()
 if db is None:
     st.stop()
-st.write("2")
-# Firestore 연결 테스트
+
+# Firestore 연결 테스트 - 전체 컬렉션 리스트 대신 간단한 쿼리로 변경
 def test_firestore_connection():
     try:
-        list(db.collections())
+        # subjects 컬렉션에서 첫 번째 문서만 가져오기 시도
+        subjects_ref = db.collection("subjects")
+        _ = next(subjects_ref.limit(1).stream(), None)
         st.success("Firestore 연결 성공")
     except Exception as e:
         st.error("Firestore 연결 실패. 서비스 계정 키나 권한을 확인하세요.")
         st.error(e)
 
 test_firestore_connection()
-st.write("3")
+
 menu = st.sidebar.selectbox("메뉴 선택", ["교과 관리", "수업 관리", "학생 관리", "진도 관리", "출결 관리"])
 
 if menu == "교과 관리" and db:
