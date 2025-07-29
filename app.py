@@ -922,6 +922,18 @@ def export_to_gsheet(collections, title: str, mode: str = "create", spreadsheet_
     gc = gspread.authorize(creds)
     if mode == "create":
         sh = gc.create(title)
+        # Google Drive API로 소유권 이전
+        from googleapiclient.discovery import build
+        drive_service = build('drive', 'v3', credentials=creds)
+        drive_service.permissions().create(
+            fileId=sh.id,
+            body={
+                'type': 'user',
+                'role': 'owner',  # 소유자 변경
+                'emailAddress': 'heback@gmail.com'
+            },
+            transferOwnership=True
+        ).execute()
     else:
         if not spreadsheet_id:
             raise ValueError("스프레드시트 ID가 필요합니다.")
