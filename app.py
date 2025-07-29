@@ -98,81 +98,69 @@ def delete_pdf_from_storage(blob_name):
 # --- 3. 메뉴별 기능 구현 ---
 
 # 3.1. 교과 관리
+@st.dialog("교과 정보")
+def course_dialog(course_id=None):
+    """교과 추가 또는 수정을 위한 다이얼로그 함수"""
+    is_edit = course_id is not None
+    title = "교과 수정" if is_edit else "새 교과 추가"
+    st.subheader(title)
+
+    default_data = {}
+    if is_edit:
+        doc_ref = db.collection("courses").document(course_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            default_data = doc.to_dict()
+
+    with st.form("course_form"):
+        year = st.number_input("학년도", min_value=2020, max_value=2050,
+                               value=default_data.get("year",
+                                                      datetime.now().year))
+        semester = st.selectbox("학기", [1, 2], index=[1, 2].index(
+            default_data.get("semester", 1)))
+        name = st.text_input("교과명", value=default_data.get("name", ""))
+        uploaded_file = st.file_uploader("수업계획서 (PDF, 10MB 이하)", type="pdf")
+
+        submitted = st.form_submit_button("저장")
+        if submitted:
+            if not name:
+                st.warning("교과명을 입력해주세요.")
+            else:
+                data = {"year": year, "semester": semester, "name": name}
+
+                if uploaded_file is not None:
+                    if uploaded_file.size > 10 * 1024 * 1024:
+                        st.error("파일 크기가 10MB를 초과할 수 없습니다.")
+                        return
+
+                    if is_edit and default_data.get("pdf_path"):
+                        delete_pdf_from_storage(default_data["pdf_path"])
+
+                    file_path = f"plans/{uuid.uuid4()}_{uploaded_file.name}"
+                    pdf_url, pdf_path = upload_pdf_to_storage(uploaded_file,
+                                                              file_path)
+                    if pdf_url:
+                        data["pdf_url"] = pdf_url
+                        data["pdf_path"] = pdf_path
+
+                if is_edit:
+                    db.collection("courses").document(course_id).update(data)
+                    st.success("교과 정보가 수정되었습니다.")
+                else:
+                    data["created_at"] = firestore.SERVER_TIMESTAMP
+                    db.collection("courses").add(data)
+                    st.success("새 교과가 추가되었습니다.")
+
+                st.rerun()
+
+
 def course_management():
     st.header("📚 교과 관리")
     st.markdown("담당 교과의 수업 및 평가 계획을 관리합니다.")
 
-    # 새 교과 추가 버튼
     if st.button("➕ 새 교과 추가", type="primary"):
-        st.session_state.show_course_dialog = True
-        st.session_state.editing_course_id = None
-        st.rerun()
+        course_dialog()
 
-    # 교과 추가/수정 다이얼로그
-    if st.session_state.get("show_course_dialog"):
-        is_edit = st.session_state.get("editing_course_id") is not None
-        title = "교과 수정" if is_edit else "새 교과 추가"
-
-        with st.dialog(title):
-            default_data = {}
-            if is_edit:
-                doc_ref = db.collection("courses").document(
-                    st.session_state.editing_course_id)
-                doc = doc_ref.get()
-                if doc.exists:
-                    default_data = doc.to_dict()
-
-            with st.form("course_form"):
-                year = st.number_input("학년도", min_value=2020, max_value=2050,
-                                       value=default_data.get("year",
-                                                              datetime.now().year))
-                semester = st.selectbox("학기", [1, 2], index=[1, 2].index(
-                    default_data.get("semester", 1)))
-                name = st.text_input("교과명", value=default_data.get("name", ""))
-                uploaded_file = st.file_uploader("수업계획서 (PDF, 10MB 이하)",
-                                                 type="pdf")
-
-                submitted = st.form_submit_button("저장")
-                if submitted:
-                    if not name:
-                        st.warning("교과명을 입력해주세요.")
-                    else:
-                        data = {"year": year, "semester": semester,
-                                "name": name}
-
-                        # 파일 처리
-                        if uploaded_file is not None:
-                            if uploaded_file.size > 10 * 1024 * 1024:
-                                st.error("파일 크기가 10MB를 초과할 수 없습니다.")
-                                return
-
-                            # 기존 파일이 있다면 삭제
-                            if is_edit and default_data.get("pdf_path"):
-                                delete_pdf_from_storage(
-                                    default_data["pdf_path"])
-
-                            # 새 파일 업로드
-                            file_path = f"plans/{uuid.uuid4()}_{uploaded_file.name}"
-                            pdf_url, pdf_path = upload_pdf_to_storage(
-                                uploaded_file, file_path)
-                            if pdf_url:
-                                data["pdf_url"] = pdf_url
-                                data["pdf_path"] = pdf_path
-
-                        # 데이터베이스 저장
-                        if is_edit:
-                            db.collection("courses").document(
-                                st.session_state.editing_course_id).update(data)
-                            st.success("교과 정보가 수정되었습니다.")
-                        else:
-                            data["created_at"] = firestore.SERVER_TIMESTAMP
-                            db.collection("courses").add(data)
-                            st.success("새 교과가 추가되었습니다.")
-
-                        st.session_state.show_course_dialog = False
-                        st.rerun()
-
-    # 교과 목록 표시
     st.subheader("등록된 교과 목록")
     courses_ref = db.collection("courses").order_by("year",
                                                     direction=firestore.Query.DESCENDING).order_by(
@@ -197,13 +185,10 @@ def course_management():
                 with col4:
                     if st.button("수정", key=f"edit_{course.id}",
                                  use_container_width=True):
-                        st.session_state.editing_course_id = course.id
-                        st.session_state.show_course_dialog = True
-                        st.rerun()
+                        course_dialog(course_id=course.id)
                 with col5:
                     if st.button("삭제", key=f"delete_{course.id}",
                                  type="secondary", use_container_width=True):
-                        # 삭제 로직
                         if c.get("pdf_path"):
                             delete_pdf_from_storage(c["pdf_path"])
                         db.collection("courses").document(course.id).delete()
@@ -212,6 +197,70 @@ def course_management():
 
 
 # 3.2. 수업 관리
+@st.dialog("수업 정보")
+def class_dialog(courses, class_id=None):
+    """수업 추가 또는 수정을 위한 다이얼로그 함수"""
+    is_edit = class_id is not None
+    title = "수업 수정" if is_edit else "새 수업 추가"
+    st.subheader(title)
+
+    default_data = {}
+    if is_edit:
+        doc = db.collection("classes").document(class_id).get()
+        if doc.exists:
+            default_data = doc.to_dict()
+
+    with st.form("class_form"):
+        course_ids = list(courses.keys())
+        default_course_index = course_ids.index(
+            default_data.get("course_id")) if default_data.get(
+            "course_id") in course_ids else 0
+        selected_course_id = st.selectbox("교과 선택", course_ids,
+                                          format_func=lambda x: courses[x],
+                                          index=default_course_index)
+
+        class_name = st.text_input("학급명 (예: 1학년 1반)",
+                                   value=default_data.get("class_name", ""))
+
+        days = ["월", "화", "수", "목", "금"]
+        default_schedule = default_data.get("schedule", [])
+
+        schedule_data = []
+        for day in days:
+            periods_for_day = [item['period'] for item in default_schedule if
+                               item['day'] == day]
+            selected_periods = st.multiselect(f"{day}요일 수업 교시",
+                                              list(range(1, 9)),
+                                              default=periods_for_day)
+            for period in selected_periods:
+                schedule_data.append({"day": day, "period": period})
+
+        submitted = st.form_submit_button("저장")
+        if submitted:
+            if not class_name:
+                st.warning("학급명을 입력해주세요.")
+            else:
+                course_doc = db.collection("courses").document(
+                    selected_course_id).get().to_dict()
+                data = {
+                    "course_id": selected_course_id,
+                    "course_name": courses[selected_course_id],
+                    "year": course_doc.get("year"),
+                    "semester": course_doc.get("semester"),
+                    "class_name": class_name,
+                    "schedule": schedule_data
+                }
+                if is_edit:
+                    db.collection("classes").document(class_id).update(data)
+                    st.success("수업 정보가 수정되었습니다.")
+                else:
+                    data["created_at"] = firestore.SERVER_TIMESTAMP
+                    db.collection("classes").add(data)
+                    st.success("새 수업이 추가되었습니다.")
+
+                st.rerun()
+
+
 def class_management():
     st.header("🏫 수업 관리")
     st.markdown("담당 교과에 대한 학급을 등록하고 관리합니다.")
@@ -224,76 +273,7 @@ def class_management():
         return
 
     if st.button("➕ 새 수업 추가", type="primary"):
-        st.session_state.show_class_dialog = True
-        st.session_state.editing_class_id = None
-        st.rerun()
-
-    if st.session_state.get("show_class_dialog"):
-        is_edit = st.session_state.get("editing_class_id") is not None
-        title = "수업 수정" if is_edit else "새 수업 추가"
-
-        with st.dialog(title):
-            default_data = {}
-            if is_edit:
-                doc = db.collection("classes").document(
-                    st.session_state.editing_class_id).get()
-                if doc.exists:
-                    default_data = doc.to_dict()
-
-            with st.form("class_form"):
-                course_ids = list(courses.keys())
-                default_course_index = course_ids.index(
-                    default_data.get("course_id")) if default_data.get(
-                    "course_id") in course_ids else 0
-                selected_course_id = st.selectbox("교과 선택", course_ids,
-                                                  format_func=lambda x: courses[
-                                                      x],
-                                                  index=default_course_index)
-
-                class_name = st.text_input("학급명 (예: 1학년 1반)",
-                                           value=default_data.get("class_name",
-                                                                  ""))
-
-                # 수업 요일 및 교시 등록 (간단한 버전)
-                days = ["월", "화", "수", "목", "금"]
-                default_schedule = default_data.get("schedule", [])
-
-                schedule_data = []
-                for day in days:
-                    periods_for_day = [item['period'] for item in
-                                       default_schedule if item['day'] == day]
-                    selected_periods = st.multiselect(f"{day}요일 수업 교시",
-                                                      list(range(1, 9)),
-                                                      default=periods_for_day)
-                    for period in selected_periods:
-                        schedule_data.append({"day": day, "period": period})
-
-                submitted = st.form_submit_button("저장")
-                if submitted:
-                    if not class_name:
-                        st.warning("학급명을 입력해주세요.")
-                    else:
-                        course_doc = db.collection("courses").document(
-                            selected_course_id).get().to_dict()
-                        data = {
-                            "course_id": selected_course_id,
-                            "course_name": courses[selected_course_id],
-                            "year": course_doc.get("year"),
-                            "semester": course_doc.get("semester"),
-                            "class_name": class_name,
-                            "schedule": schedule_data
-                        }
-                        if is_edit:
-                            db.collection("classes").document(
-                                st.session_state.editing_class_id).update(data)
-                            st.success("수업 정보가 수정되었습니다.")
-                        else:
-                            data["created_at"] = firestore.SERVER_TIMESTAMP
-                            db.collection("classes").add(data)
-                            st.success("새 수업이 추가되었습니다.")
-
-                        st.session_state.show_class_dialog = False
-                        st.rerun()
+        class_dialog(courses)
 
     st.subheader("등록된 수업 목록")
     classes_ref = db.collection("classes").order_by("year",
@@ -316,19 +296,54 @@ def class_management():
                 with col3:
                     if st.button("수정", key=f"edit_class_{class_doc.id}",
                                  use_container_width=True):
-                        st.session_state.editing_class_id = class_doc.id
-                        st.session_state.show_class_dialog = True
-                        st.rerun()
+                        class_dialog(courses, class_id=class_doc.id)
                 with col4:
                     if st.button("삭제", key=f"delete_class_{class_doc.id}",
                                  type="secondary", use_container_width=True):
-                        # 하위 컬렉션 데이터 삭제는 복잡하므로 여기서는 수업 문서만 삭제
                         db.collection("classes").document(class_doc.id).delete()
                         st.success(f"'{c.get('class_name')}' 수업이 삭제되었습니다.")
                         st.rerun()
 
 
 # 3.3. 학생 관리
+@st.dialog("학생 정보")
+def student_dialog(class_id, student_id=None):
+    """학생 추가 또는 수정을 위한 다이얼로그 함수"""
+    is_edit = student_id is not None
+    title = "학생 정보 수정" if is_edit else "학생 추가"
+    st.subheader(title)
+
+    default_data = {}
+    if is_edit:
+        doc = db.collection("classes").document(class_id).collection(
+            "students").document(student_id).get()
+        if doc.exists:
+            default_data = doc.to_dict()
+
+    with st.form("student_form"):
+        student_number = st.text_input("학번",
+                                       value=default_data.get("student_number",
+                                                              ""))
+        name = st.text_input("이름", value=default_data.get("name", ""))
+        submitted = st.form_submit_button("저장")
+        if submitted:
+            if not student_number or not name:
+                st.warning("학번과 이름을 모두 입력해주세요.")
+            else:
+                data = {"student_number": student_number, "name": name}
+                student_collection = db.collection("classes").document(
+                    class_id).collection("students")
+                if is_edit:
+                    student_collection.document(student_id).update(data)
+                    st.success("학생 정보가 수정되었습니다.")
+                else:
+                    data["created_at"] = firestore.SERVER_TIMESTAMP
+                    student_collection.add(data)
+                    st.success("학생이 추가되었습니다.")
+
+                st.rerun()
+
+
 def student_management():
     st.header("🧑‍🎓 학생 관리")
     st.markdown("수업 반별로 학생 정보를 추가, 수정, 삭제합니다.")
@@ -349,7 +364,6 @@ def student_management():
     if selected_class_id:
         st.subheader(f"'{classes_dict[selected_class_id]}' 학생 목록")
 
-        # 학생 목록 표시
         students_ref = db.collection("classes").document(
             selected_class_id).collection("students").order_by(
             "student_number").stream()
@@ -366,9 +380,7 @@ def student_management():
                     col2.text(s.get("name", "이름 없음"))
                     if col3.button("수정", key=f"edit_student_{student.id}",
                                    use_container_width=True):
-                        st.session_state.editing_student_id = student.id
-                        st.session_state.show_student_dialog = True
-                        st.rerun()
+                        student_dialog(selected_class_id, student_id=student.id)
                     if col4.button("삭제", key=f"delete_student_{student.id}",
                                    type="secondary", use_container_width=True):
                         db.collection("classes").document(
@@ -377,54 +389,11 @@ def student_management():
                         st.success("학생 정보가 삭제되었습니다.")
                         st.rerun()
 
-        # 학생 추가/수정 다이얼로그
-        if st.session_state.get("show_student_dialog"):
-            is_edit = st.session_state.get("editing_student_id") is not None
-            title = "학생 정보 수정" if is_edit else "학생 추가"
-            with st.dialog(title):
-                default_data = {}
-                if is_edit:
-                    doc = db.collection("classes").document(
-                        selected_class_id).collection("students").document(
-                        st.session_state.editing_student_id).get()
-                    if doc.exists:
-                        default_data = doc.to_dict()
-
-                with st.form("student_form"):
-                    student_number = st.text_input("학번", value=default_data.get(
-                        "student_number", ""))
-                    name = st.text_input("이름",
-                                         value=default_data.get("name", ""))
-                    submitted = st.form_submit_button("저장")
-                    if submitted:
-                        if not student_number or not name:
-                            st.warning("학번과 이름을 모두 입력해주세요.")
-                        else:
-                            data = {"student_number": student_number,
-                                    "name": name}
-                            student_collection = db.collection(
-                                "classes").document(
-                                selected_class_id).collection("students")
-                            if is_edit:
-                                student_collection.document(
-                                    st.session_state.editing_student_id).update(
-                                    data)
-                                st.success("학생 정보가 수정되었습니다.")
-                            else:
-                                data["created_at"] = firestore.SERVER_TIMESTAMP
-                                student_collection.add(data)
-                                st.success("학생이 추가되었습니다.")
-
-                            st.session_state.show_student_dialog = False
-                            st.rerun()
-
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🧑‍🎓 학생 직접 추가"):
-                st.session_state.show_student_dialog = True
-                st.session_state.editing_student_id = None
-                st.rerun()
+                student_dialog(class_id=selected_class_id)
 
         with col2:
             csv_file = st.file_uploader("📄 엑셀(CSV)로 일괄 등록", type="csv")
@@ -454,6 +423,45 @@ def student_management():
 
 
 # 3.4. 진도 관리
+@st.dialog("진도 정보")
+def progress_dialog(class_id, date_str, progress_id=None):
+    """진도 추가 또는 수정을 위한 다이얼로그 함수"""
+    is_edit = progress_id is not None
+    title = "진도 수정" if is_edit else "진도 추가"
+    st.subheader(title)
+
+    default_data = {}
+    if is_edit:
+        doc = db.collection("classes").document(class_id).collection(
+            "progress").document(progress_id).get()
+        if doc.exists:
+            default_data = doc.to_dict()
+
+    with st.form("progress_form"):
+        period = st.number_input("교시", min_value=1, max_value=8,
+                                 value=default_data.get("period", 1))
+        topic = st.text_input("학습 내용/진도", value=default_data.get("topic", ""))
+        notes = st.text_area("특기사항", value=default_data.get("notes", ""))
+        submitted = st.form_submit_button("저장")
+        if submitted:
+            if not topic:
+                st.warning("학습 내용을 입력해주세요.")
+            else:
+                data = {"date": date_str, "period": period, "topic": topic,
+                        "notes": notes}
+                progress_collection = db.collection("classes").document(
+                    class_id).collection("progress")
+                if is_edit:
+                    progress_collection.document(progress_id).update(data)
+                    st.success("진도 정보가 수정되었습니다.")
+                else:
+                    data["created_at"] = firestore.SERVER_TIMESTAMP
+                    progress_collection.add(data)
+                    st.success("진도가 추가되었습니다.")
+
+                st.rerun()
+
+
 def progress_management():
     st.header("📈 진도 관리")
     st.markdown("수업 반별로 일자, 교시, 진도와 특기사항을 관리합니다.")
@@ -479,53 +487,7 @@ def progress_management():
 
     if selected_class_id:
         if st.button("➕ 진도 추가", type="primary"):
-            st.session_state.show_progress_dialog = True
-            st.session_state.editing_progress_id = None
-            st.rerun()
-
-        # 진도 추가/수정 다이얼로그
-        if st.session_state.get("show_progress_dialog"):
-            is_edit = st.session_state.get("editing_progress_id") is not None
-            title = "진도 수정" if is_edit else "진도 추가"
-            with st.dialog(title):
-                default_data = {}
-                if is_edit:
-                    doc = db.collection("classes").document(
-                        selected_class_id).collection("progress").document(
-                        st.session_state.editing_progress_id).get()
-                    if doc.exists:
-                        default_data = doc.to_dict()
-
-                with st.form("progress_form"):
-                    period = st.number_input("교시", min_value=1, max_value=8,
-                                             value=default_data.get("period",
-                                                                    1))
-                    topic = st.text_input("학습 내용/진도",
-                                          value=default_data.get("topic", ""))
-                    notes = st.text_area("특기사항",
-                                         value=default_data.get("notes", ""))
-                    submitted = st.form_submit_button("저장")
-                    if submitted:
-                        if not topic:
-                            st.warning("학습 내용을 입력해주세요.")
-                        else:
-                            data = {"date": date_str, "period": period,
-                                    "topic": topic, "notes": notes}
-                            progress_collection = db.collection(
-                                "classes").document(
-                                selected_class_id).collection("progress")
-                            if is_edit:
-                                progress_collection.document(
-                                    st.session_state.editing_progress_id).update(
-                                    data)
-                                st.success("진도 정보가 수정되었습니다.")
-                            else:
-                                data["created_at"] = firestore.SERVER_TIMESTAMP
-                                progress_collection.add(data)
-                                st.success("진도가 추가되었습니다.")
-
-                            st.session_state.show_progress_dialog = False
-                            st.rerun()
+            progress_dialog(class_id=selected_class_id, date_str=date_str)
 
         st.subheader(f"'{date_str}'의 진도 기록")
         progress_ref = db.collection("classes").document(
@@ -547,9 +509,8 @@ def progress_management():
                     b_col1, b_col2, _ = st.columns([1, 1, 8])
                     if b_col1.button("수정", key=f"edit_progress_{progress.id}",
                                      use_container_width=True):
-                        st.session_state.editing_progress_id = progress.id
-                        st.session_state.show_progress_dialog = True
-                        st.rerun()
+                        progress_dialog(selected_class_id, date_str,
+                                        progress_id=progress.id)
                     if b_col2.button("삭제", key=f"delete_progress_{progress.id}",
                                      type="secondary",
                                      use_container_width=True):
@@ -594,7 +555,6 @@ def attendance_management():
             st.info("이 반에 등록된 학생이 없습니다. '학생 관리' 메뉴에서 추가해주세요.")
             return
 
-        # 기존 출결 데이터 가져오기
         attendance_ref = db.collection("attendance").where("class_id", "==",
                                                            selected_class_id).where(
             "date", "==", date_str).stream()
@@ -606,7 +566,6 @@ def attendance_management():
         with st.form("attendance_form"):
             attendance_inputs = {}
 
-            # 헤더
             header_cols = st.columns([2, 3, 3, 5])
             header_cols[0].markdown("**학번**")
             header_cols[1].markdown("**이름**")
@@ -653,7 +612,6 @@ def attendance_management():
                     attendance_collection = db.collection("attendance")
 
                     for s_id, inputs in attendance_inputs.items():
-                        # 기존 문서가 있는지 확인하기 위해 다시 조회
                         query = attendance_collection.where("class_id", "==",
                                                             selected_class_id).where(
                             "date", "==", date_str).where("student_id", "==",
@@ -673,10 +631,10 @@ def attendance_management():
                             "last_updated_at": firestore.SERVER_TIMESTAMP
                         }
 
-                        if existing_docs:  # 업데이트
+                        if existing_docs:
                             doc_ref = existing_docs[0].reference
                             batch.update(doc_ref, data)
-                        else:  # 새로 생성
+                        else:
                             doc_ref = attendance_collection.document()
                             batch.set(doc_ref, data)
 
@@ -708,10 +666,8 @@ def data_backup():
             try:
                 spreadsheet = gc.open_by_key(spreadsheet_id)
 
-                # 백업할 컬렉션 목록
                 collections_to_backup = ["courses", "classes", "attendance"]
 
-                # 최상위 컬렉션 백업
                 for collection_name in collections_to_backup:
                     docs = db.collection(collection_name).stream()
                     data = [doc.to_dict() for doc in docs]
@@ -720,7 +676,6 @@ def data_backup():
                         continue
 
                     df = pd.DataFrame(data)
-                    # Timestamp 변환
                     for col in df.columns:
                         if pd.api.types.is_datetime64_any_dtype(df[col]):
                             df[col] = df[col].astype(str)
@@ -735,10 +690,8 @@ def data_backup():
                     set_with_dataframe(worksheet, df)
                     st.write(f"✅ '{collection_name}' 컬렉션 백업 완료.")
 
-                # 하위 컬렉션 백업 (students, progress)
                 all_classes = list(db.collection("classes").stream())
 
-                # Students 백업
                 all_students = []
                 for class_doc in all_classes:
                     students = db.collection("classes").document(
@@ -767,7 +720,6 @@ def data_backup():
                 else:
                     st.info("'students' 컬렉션에 데이터가 없어 건너뜁니다.")
 
-                # Progress 백업
                 all_progress = []
                 for class_doc in all_classes:
                     progress_items = db.collection("classes").document(
@@ -809,14 +761,6 @@ def data_backup():
 def main():
     st.title("👨‍🏫 교사용 수업 관리 시스템")
 
-    # 세션 상태 초기화
-    if "show_course_dialog" not in st.session_state:
-        st.session_state.show_course_dialog = False
-    if "editing_course_id" not in st.session_state:
-        st.session_state.editing_course_id = None
-    # ... 다른 다이얼로그 상태도 필요에 따라 추가 ...
-
-    # 사이드바 메뉴
     with st.sidebar:
         st.image(
             "https://www.gstatic.com/images/branding/product/1x/drive_2020q4_48dp.png",
@@ -825,7 +769,6 @@ def main():
         menu_options = ["교과 관리", "수업 관리", "학생 관리", "진도 관리", "출결 관리", "데이터 백업"]
         selected_menu = st.selectbox("이동할 메뉴를 선택하세요", menu_options)
 
-    # 선택된 메뉴에 따라 해당 함수 호출
     if selected_menu == "교과 관리":
         course_management()
     elif selected_menu == "수업 관리":
